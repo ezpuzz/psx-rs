@@ -1,11 +1,15 @@
 pub mod bios;
 mod ram;
 mod dma;
+mod timers;
+
+use timekeeper::TimeKeeper;
+use gpu::Gpu;
 
 use self::bios::Bios;
 use self::ram::Ram;
 use self::dma::{Dma, Port, Direction, Step, Sync};
-use gpu::Gpu;
+use self::timers::Timers;
 
 /// Global interconnect
 pub struct Interconnect {
@@ -17,20 +21,23 @@ pub struct Interconnect {
     dma: Dma,
     /// Graphics Processor Unit
     gpu: Gpu,
+    /// Timers
+    timers: Timers,
 }
 
 impl Interconnect {
     pub fn new(bios: Bios, gpu: Gpu) -> Interconnect {
         Interconnect {
             bios: bios,
-            ram:  Ram::new(),
-            dma:  Dma::new(),
-            gpu:  gpu,
+            ram: Ram::new(),
+            dma: Dma::new(),
+            gpu: gpu,
+            timers: Timers::new(),
         }
     }
 
     /// Load 32bit word at `addr`
-    pub fn load32(&self, addr: u32) -> u32 {
+    pub fn load32(&mut self, timekeeper: &mut TimeKeeper, addr: u32) -> u32 {
         let abs_addr = map::mask_region(addr);
 
         if let Some(offset) = map::RAM.contains(abs_addr) {
@@ -59,8 +66,8 @@ impl Interconnect {
         }
 
         if let Some(offset) = map::TIMERS.contains(abs_addr) {
-            println!("Unhandled read from timer register {:x}",
-                     offset);
+            panic!("Unhandled read from timer register {:x}",
+                   offset);
             return 0;
         }
 
@@ -68,7 +75,7 @@ impl Interconnect {
     }
 
     /// Load 16bit halfword at `addr`
-    pub fn load16(&self, addr: u32) -> u16 {
+    pub fn load16(&mut self, timekeeper: &mut TimeKeeper, addr: u32) -> u16 {
         let abs_addr = map::mask_region(addr);
 
         if let Some(offset) = map::RAM.contains(abs_addr) {
@@ -90,7 +97,7 @@ impl Interconnect {
     }
 
     /// Load byte at `addr`
-    pub fn load8(&self, addr: u32) -> u8 {
+    pub fn load8(&mut self, timekeeper: &mut TimeKeeper, addr: u32) -> u8 {
 
         let abs_addr = map::mask_region(addr);
 
@@ -111,7 +118,10 @@ impl Interconnect {
     }
 
     /// Store 32bit word `val` into `addr`
-    pub fn store32(&mut self, addr: u32, val: u32) {
+    pub fn store32(&mut self,
+                   timekeeper: &mut TimeKeeper,
+                   addr: u32,
+                   val: u32) {
 
         let abs_addr = map::mask_region(addr);
 
@@ -142,7 +152,7 @@ impl Interconnect {
         }
 
         if let Some(offset) = map::TIMERS.contains(abs_addr) {
-            println!("Unhandled write to timer register {:x}: {:08x}",
+            panic!("Unhandled write to timer register {:x}: {:08x}",
                      offset, val);
             return;
         }
@@ -179,7 +189,9 @@ impl Interconnect {
     }
 
     /// Store 16bit halfword `val` into `addr`
-    pub fn store16(&mut self, addr: u32, val: u16) {
+    pub fn store16(&mut self, timekeeper: &mut TimeKeeper,
+                   addr: u32,
+                   val: u16) {
 
         let abs_addr = map::mask_region(addr);
 
@@ -194,7 +206,7 @@ impl Interconnect {
         }
 
         if let Some(offset) = map::TIMERS.contains(abs_addr) {
-            println!("Unhandled write to timer register {:x}", offset);
+            self.timers.set_reg(timekeeper, &mut self.gpu, offset, val);
             return;
         }
 
@@ -207,7 +219,10 @@ impl Interconnect {
     }
 
     /// Store byte `val` into `addr`
-    pub fn store8(&mut self, addr: u32, val: u8) {
+    pub fn store8(&mut self,
+                  timekeeper: &mut TimeKeeper,
+                  addr: u32,
+                  val: u8) {
         let abs_addr = map::mask_region(addr);
 
         if let Some(offset) = map::RAM.contains(abs_addr) {

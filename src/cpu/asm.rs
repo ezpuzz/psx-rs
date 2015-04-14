@@ -1,5 +1,7 @@
 use super::{Instruction, RegisterIndex};
 
+// XXX Dead code while we can't fetch current instruction in Debug
+#[allow(dead_code)]
 pub fn decode(instruction: Instruction) -> String {
     match instruction.function() {
         0b000000 => match instruction.subfunction() {

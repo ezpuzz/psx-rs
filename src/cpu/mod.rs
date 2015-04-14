@@ -1,5 +1,6 @@
 use std::fmt::{Debug, Display, Formatter, Error};
 
+use timekeeper::TimeKeeper;
 use memory::Interconnect;
 
 mod asm;
@@ -75,7 +76,7 @@ impl Cpu {
     }
 
     /// Run a single CPU instruction and return
-    pub fn run_next_instruction(&mut self) {
+    pub fn run_next_instruction(&mut self, timekeeper: &mut TimeKeeper) {
         // Save the address of the current instruction to save in
         // `EPC` in case of an exception.
         self.current_pc = self.pc;
@@ -87,7 +88,10 @@ impl Cpu {
         }
 
         // Fetch instruction at PC
-        let instruction = Instruction(self.load32(self.pc));
+        // XXX Need to emulate the instruction cache, for now we pay
+        // the full uncached acces time
+        let pc = self.pc;
+        let instruction = Instruction(self.load32(timekeeper, pc));
 
         // Increment PC to point to the next instruction. and
         // `next_pc` to the one after that. Both values can be
@@ -111,58 +115,58 @@ impl Cpu {
         self.delay_slot = self.branch;
         self.branch     = false;
 
-        self.decode_and_execute(instruction);
+        self.decode_and_execute(timekeeper, instruction);
 
         // Copy the output registers as input for the next instruction
         self.regs = self.out_regs;
     }
 
     /// Load 32bit value from the memory
-    fn load32(&self, addr: u32) -> u32 {
-        self.inter.load32(addr)
+    fn load32(&mut self, timekeeper: &mut TimeKeeper, addr: u32) -> u32 {
+        self.inter.load32(timekeeper, addr)
     }
 
     /// Load 16bit value from the memory
-    fn load16(&self, addr: u32) -> u16 {
-        self.inter.load16(addr)
+    fn load16(&mut self, timekeeper: &mut TimeKeeper, addr: u32) -> u16 {
+        self.inter.load16(timekeeper, addr)
     }
 
     /// Load 8bit value from the memory
-    fn load8(&self, addr: u32) -> u8 {
-        self.inter.load8(addr)
+    fn load8(&mut self, timekeeper: &mut TimeKeeper, addr: u32) -> u8 {
+        self.inter.load8(timekeeper, addr)
     }
 
     /// Store 32bit value into the memory
-    fn store32(&mut self, addr: u32, val: u32) {
+    fn store32(&mut self, timekeeper: &mut TimeKeeper, addr: u32, val: u32) {
         if self.sr & 0x10000 != 0 {
             // Cache is isolated, ignore write
             println!("Ignoring store while cache is isolated");
             return;
         }
 
-        self.inter.store32(addr, val);
+        self.inter.store32(timekeeper, addr, val);
     }
 
     /// Store 16bit value into the memory
-    fn store16(&mut self, addr: u32, val: u16) {
+    fn store16(&mut self, timekeeper: &mut TimeKeeper, addr: u32, val: u16) {
         if self.sr & 0x10000 != 0 {
             // Cache is isolated, ignore write
             println!("Ignoring store while cache is isolated");
             return;
         }
 
-        self.inter.store16(addr, val);
+        self.inter.store16(timekeeper, addr, val);
     }
 
     /// Store 8bit value into the memory
-    fn store8(&mut self, addr: u32, val: u8) {
+    fn store8(&mut self, timekeeper: &mut TimeKeeper, addr: u32, val: u8) {
         if self.sr & 0x10000 != 0 {
             // Cache is isolated, ignore write
             println!("Ignoring store while cache is isolated");
             return;
         }
 
-        self.inter.store8(addr, val);
+        self.inter.store8(timekeeper, addr, val);
     }
 
     /// Branch to immediate value `offset`.
@@ -228,90 +232,90 @@ impl Cpu {
     }
 
     /// Decode `instruction`'s opcode and run the function
-    fn decode_and_execute(&mut self, instruction: Instruction) {
-        match instruction.function() {
-            0b000000 => match instruction.subfunction() {
-                0b000000 => self.op_sll(instruction),
-                0b000010 => self.op_srl(instruction),
-                0b000011 => self.op_sra(instruction),
-                0b000100 => self.op_sllv(instruction),
-                0b000110 => self.op_srlv(instruction),
-                0b000111 => self.op_srav(instruction),
-                0b001000 => self.op_jr(instruction),
-                0b001001 => self.op_jalr(instruction),
-                0b001100 => self.op_syscall(instruction),
-                0b001101 => self.op_break(instruction),
-                0b010000 => self.op_mfhi(instruction),
-                0b010001 => self.op_mthi(instruction),
-                0b010010 => self.op_mflo(instruction),
-                0b010011 => self.op_mtlo(instruction),
-                0b011000 => self.op_mult(instruction),
-                0b011001 => self.op_multu(instruction),
-                0b011010 => self.op_div(instruction),
-                0b011011 => self.op_divu(instruction),
-                0b100000 => self.op_add(instruction),
-                0b100001 => self.op_addu(instruction),
-                0b100010 => self.op_sub(instruction),
-                0b100011 => self.op_subu(instruction),
-                0b100100 => self.op_and(instruction),
-                0b100101 => self.op_or(instruction),
-                0b100110 => self.op_xor(instruction),
-                0b100111 => self.op_nor(instruction),
-                0b101010 => self.op_slt(instruction),
-                0b101011 => self.op_sltu(instruction),
-                _        => self.op_illegal(instruction),
+    fn decode_and_execute(&mut self, tk: &mut TimeKeeper, i: Instruction) {
+        match i.function() {
+            0b000000 => match i.subfunction() {
+                0b000000 => self.op_sll(tk, i),
+                0b000010 => self.op_srl(tk, i),
+                0b000011 => self.op_sra(tk, i),
+                0b000100 => self.op_sllv(tk, i),
+                0b000110 => self.op_srlv(tk, i),
+                0b000111 => self.op_srav(tk, i),
+                0b001000 => self.op_jr(tk, i),
+                0b001001 => self.op_jalr(tk, i),
+                0b001100 => self.op_syscall(tk, i),
+                0b001101 => self.op_break(tk, i),
+                0b010000 => self.op_mfhi(tk, i),
+                0b010001 => self.op_mthi(tk, i),
+                0b010010 => self.op_mflo(tk, i),
+                0b010011 => self.op_mtlo(tk, i),
+                0b011000 => self.op_mult(tk, i),
+                0b011001 => self.op_multu(tk, i),
+                0b011010 => self.op_div(tk, i),
+                0b011011 => self.op_divu(tk, i),
+                0b100000 => self.op_add(tk, i),
+                0b100001 => self.op_addu(tk, i),
+                0b100010 => self.op_sub(tk, i),
+                0b100011 => self.op_subu(tk, i),
+                0b100100 => self.op_and(tk, i),
+                0b100101 => self.op_or(tk, i),
+                0b100110 => self.op_xor(tk, i),
+                0b100111 => self.op_nor(tk, i),
+                0b101010 => self.op_slt(tk, i),
+                0b101011 => self.op_sltu(tk, i),
+                _        => self.op_illegal(tk, i),
             },
-            0b000001 => self.op_bxx(instruction),
-            0b000010 => self.op_j(instruction),
-            0b000011 => self.op_jal(instruction),
-            0b000100 => self.op_beq(instruction),
-            0b000101 => self.op_bne(instruction),
-            0b000110 => self.op_blez(instruction),
-            0b000111 => self.op_bgtz(instruction),
-            0b001000 => self.op_addi(instruction),
-            0b001001 => self.op_addiu(instruction),
-            0b001010 => self.op_slti(instruction),
-            0b001011 => self.op_sltiu(instruction),
-            0b001100 => self.op_andi(instruction),
-            0b001101 => self.op_ori(instruction),
-            0b001110 => self.op_xori(instruction),
-            0b001111 => self.op_lui(instruction),
-            0b010000 => self.op_cop0(instruction),
-            0b010001 => self.op_cop1(instruction),
-            0b010010 => self.op_cop2(instruction),
-            0b010011 => self.op_cop3(instruction),
-            0b100000 => self.op_lb(instruction),
-            0b100001 => self.op_lh(instruction),
-            0b100010 => self.op_lwl(instruction),
-            0b100011 => self.op_lw(instruction),
-            0b100100 => self.op_lbu(instruction),
-            0b100101 => self.op_lhu(instruction),
-            0b100110 => self.op_lwr(instruction),
-            0b101000 => self.op_sb(instruction),
-            0b101001 => self.op_sh(instruction),
-            0b101010 => self.op_swl(instruction),
-            0b101011 => self.op_sw(instruction),
-            0b101110 => self.op_swr(instruction),
-            0b110000 => self.op_lwc0(instruction),
-            0b110001 => self.op_lwc1(instruction),
-            0b110010 => self.op_lwc2(instruction),
-            0b110011 => self.op_lwc3(instruction),
-            0b111000 => self.op_swc0(instruction),
-            0b111001 => self.op_swc1(instruction),
-            0b111010 => self.op_swc2(instruction),
-            0b111011 => self.op_swc3(instruction),
-            _        => self.op_illegal(instruction),
+            0b000001 => self.op_bxx(tk, i),
+            0b000010 => self.op_j(tk, i),
+            0b000011 => self.op_jal(tk, i),
+            0b000100 => self.op_beq(tk, i),
+            0b000101 => self.op_bne(tk, i),
+            0b000110 => self.op_blez(tk, i),
+            0b000111 => self.op_bgtz(tk, i),
+            0b001000 => self.op_addi(tk, i),
+            0b001001 => self.op_addiu(tk, i),
+            0b001010 => self.op_slti(tk, i),
+            0b001011 => self.op_sltiu(tk, i),
+            0b001100 => self.op_andi(tk, i),
+            0b001101 => self.op_ori(tk, i),
+            0b001110 => self.op_xori(tk, i),
+            0b001111 => self.op_lui(tk, i),
+            0b010000 => self.op_cop0(tk, i),
+            0b010001 => self.op_cop1(tk, i),
+            0b010010 => self.op_cop2(tk, i),
+            0b010011 => self.op_cop3(tk, i),
+            0b100000 => self.op_lb(tk, i),
+            0b100001 => self.op_lh(tk, i),
+            0b100010 => self.op_lwl(tk, i),
+            0b100011 => self.op_lw(tk, i),
+            0b100100 => self.op_lbu(tk, i),
+            0b100101 => self.op_lhu(tk, i),
+            0b100110 => self.op_lwr(tk, i),
+            0b101000 => self.op_sb(tk, i),
+            0b101001 => self.op_sh(tk, i),
+            0b101010 => self.op_swl(tk, i),
+            0b101011 => self.op_sw(tk, i),
+            0b101110 => self.op_swr(tk, i),
+            0b110000 => self.op_lwc0(tk, i),
+            0b110001 => self.op_lwc1(tk, i),
+            0b110010 => self.op_lwc2(tk, i),
+            0b110011 => self.op_lwc3(tk, i),
+            0b111000 => self.op_swc0(tk, i),
+            0b111001 => self.op_swc1(tk, i),
+            0b111010 => self.op_swc2(tk, i),
+            0b111011 => self.op_swc3(tk, i),
+            _        => self.op_illegal(tk, i),
         }
     }
 
     /// Illegal instruction
-    fn op_illegal(&mut self, instruction: Instruction) {
+    fn op_illegal(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         println!("Illegal instruction {}!", instruction);
         self.exception(Exception::IllegalInstruction);
     }
 
     /// Shift Left Logical
-    fn op_sll(&mut self, instruction: Instruction) {
+    fn op_sll(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.shift();
         let t = instruction.t();
         let d = instruction.d();
@@ -322,7 +326,7 @@ impl Cpu {
     }
 
     /// Shift Right Logical
-    fn op_srl(&mut self, instruction: Instruction) {
+    fn op_srl(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.shift();
         let t = instruction.t();
         let d = instruction.d();
@@ -333,7 +337,7 @@ impl Cpu {
     }
 
     /// Shift Right Arithmetic
-    fn op_sra(&mut self, instruction: Instruction) {
+    fn op_sra(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.shift();
         let t = instruction.t();
         let d = instruction.d();
@@ -344,7 +348,7 @@ impl Cpu {
     }
 
     /// Shift Left Logical Variable
-    fn op_sllv(&mut self, instruction: Instruction) {
+    fn op_sllv(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let d = instruction.d();
         let s = instruction.s();
         let t = instruction.t();
@@ -356,7 +360,7 @@ impl Cpu {
     }
 
     /// Shift Right Logical Variable
-    fn op_srlv(&mut self, instruction: Instruction) {
+    fn op_srlv(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let d = instruction.d();
         let s = instruction.s();
         let t = instruction.t();
@@ -368,7 +372,7 @@ impl Cpu {
     }
 
     /// Shift Right Arithmetic Variable
-    fn op_srav(&mut self, instruction: Instruction) {
+    fn op_srav(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let d = instruction.d();
         let s = instruction.s();
         let t = instruction.t();
@@ -381,7 +385,7 @@ impl Cpu {
 
     /// Various branch instructions: BGEZ, BLTZ, BGEZAL, BLTZAL. Bits
     /// 16 and 20 are used to figure out which one to use
-    fn op_bxx(&mut self, instruction: Instruction) {
+    fn op_bxx(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.imm_se();
         let s = instruction.s();
 
@@ -413,7 +417,7 @@ impl Cpu {
     }
 
     /// Jump Register
-    fn op_jr(&mut self, instruction: Instruction) {
+    fn op_jr(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let s = instruction.s();
 
         self.next_pc = self.reg(s);
@@ -422,7 +426,7 @@ impl Cpu {
     }
 
     /// Jump And Link Register
-    fn op_jalr(&mut self, instruction: Instruction) {
+    fn op_jalr(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let d = instruction.d();
         let s = instruction.s();
 
@@ -437,17 +441,17 @@ impl Cpu {
     }
 
     /// System Call
-    fn op_syscall(&mut self, _: Instruction) {
+    fn op_syscall(&mut self, _: &mut TimeKeeper, _: Instruction) {
         self.exception(Exception::SysCall);
     }
 
     /// Break
-    fn op_break(&mut self, _: Instruction) {
+    fn op_break(&mut self, _: &mut TimeKeeper, _: Instruction) {
         self.exception(Exception::Break);
     }
 
     /// Move From HI
-    fn op_mfhi(&mut self, instruction: Instruction) {
+    fn op_mfhi(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let d = instruction.d();
 
         let hi = self.hi;
@@ -456,14 +460,14 @@ impl Cpu {
     }
 
     /// Move to HI
-    fn op_mthi(&mut self, instruction: Instruction) {
+    fn op_mthi(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let s = instruction.s();
 
         self.hi = self.reg(s);
     }
 
     /// Move From LO
-    fn op_mflo(&mut self, instruction: Instruction) {
+    fn op_mflo(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let d = instruction.d();
 
         let lo = self.lo;
@@ -472,14 +476,14 @@ impl Cpu {
     }
 
     /// Move to LO
-    fn op_mtlo(&mut self, instruction: Instruction) {
+    fn op_mtlo(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let s = instruction.s();
 
         self.lo = self.reg(s);
     }
 
     /// Multiply (signed)
-    fn op_mult(&mut self, instruction: Instruction) {
+    fn op_mult(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let s = instruction.s();
         let t = instruction.t();
 
@@ -493,7 +497,7 @@ impl Cpu {
     }
 
     /// Multiply Unsigned
-    fn op_multu(&mut self, instruction: Instruction) {
+    fn op_multu(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let s = instruction.s();
         let t = instruction.t();
 
@@ -507,7 +511,7 @@ impl Cpu {
     }
 
     /// Divide (signed)
-    fn op_div(&mut self, instruction: Instruction) {
+    fn op_div(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let s = instruction.s();
         let t = instruction.t();
 
@@ -534,7 +538,7 @@ impl Cpu {
     }
 
     /// Divide Unsigned
-    fn op_divu(&mut self, instruction: Instruction) {
+    fn op_divu(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let s = instruction.s();
         let t = instruction.t();
 
@@ -552,7 +556,7 @@ impl Cpu {
     }
 
     /// Add and check for signed overflow
-    fn op_add(&mut self, instruction: Instruction) {
+    fn op_add(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let s = instruction.s();
         let t = instruction.t();
         let d = instruction.d();
@@ -567,7 +571,7 @@ impl Cpu {
     }
 
     /// Add Unsigned
-    fn op_addu(&mut self, instruction: Instruction) {
+    fn op_addu(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let s = instruction.s();
         let t = instruction.t();
         let d = instruction.d();
@@ -578,7 +582,7 @@ impl Cpu {
     }
 
     /// Substract and check for signed overflow
-    fn op_sub(&mut self, instruction: Instruction) {
+    fn op_sub(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let s = instruction.s();
         let t = instruction.t();
         let d = instruction.d();
@@ -593,7 +597,7 @@ impl Cpu {
     }
 
     /// Substract Unsigned
-    fn op_subu(&mut self, instruction: Instruction) {
+    fn op_subu(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let s = instruction.s();
         let t = instruction.t();
         let d = instruction.d();
@@ -604,7 +608,7 @@ impl Cpu {
     }
 
     /// Bitwise And
-    fn op_and(&mut self, instruction: Instruction) {
+    fn op_and(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let d = instruction.d();
         let s = instruction.s();
         let t = instruction.t();
@@ -615,7 +619,7 @@ impl Cpu {
     }
 
     /// Bitwise Or
-    fn op_or(&mut self, instruction: Instruction) {
+    fn op_or(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let d = instruction.d();
         let s = instruction.s();
         let t = instruction.t();
@@ -626,7 +630,7 @@ impl Cpu {
     }
 
     /// Bitwise Exclusive Or
-    fn op_xor(&mut self, instruction: Instruction) {
+    fn op_xor(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let d = instruction.d();
         let s = instruction.s();
         let t = instruction.t();
@@ -637,7 +641,7 @@ impl Cpu {
     }
 
     /// Bitwise Not Or
-    fn op_nor(&mut self, instruction: Instruction) {
+    fn op_nor(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let d = instruction.d();
         let s = instruction.s();
         let t = instruction.t();
@@ -648,7 +652,7 @@ impl Cpu {
     }
 
     /// Set on Less Than (signed)
-    fn op_slt(&mut self, instruction: Instruction) {
+    fn op_slt(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let d = instruction.d();
         let s = instruction.s();
         let t = instruction.t();
@@ -662,7 +666,7 @@ impl Cpu {
     }
 
     /// Set on Less Than Unsigned
-    fn op_sltu(&mut self, instruction: Instruction) {
+    fn op_sltu(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let d = instruction.d();
         let s = instruction.s();
         let t = instruction.t();
@@ -673,7 +677,7 @@ impl Cpu {
     }
 
     /// Jump
-    fn op_j(&mut self, instruction: Instruction) {
+    fn op_j(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.imm_jump();
 
         self.next_pc = (self.pc & 0xf0000000) | (i << 2);
@@ -682,19 +686,21 @@ impl Cpu {
     }
 
     /// Jump And Link
-    fn op_jal(&mut self, instruction: Instruction) {
+    fn op_jal(&mut self,
+              timekeeper: &mut TimeKeeper,
+              instruction: Instruction) {
         let ra = self.next_pc;
 
         // Store return address in R31
         self.set_reg(RegisterIndex(31), ra);
 
-        self.op_j(instruction);
+        self.op_j(timekeeper, instruction);
 
         self.branch = true;
     }
 
     /// Branch if Equal
-    fn op_beq(&mut self, instruction: Instruction) {
+    fn op_beq(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.imm_se();
         let s = instruction.s();
         let t = instruction.t();
@@ -705,7 +711,7 @@ impl Cpu {
     }
 
     /// Branch if Not Equal
-    fn op_bne(&mut self, instruction: Instruction) {
+    fn op_bne(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.imm_se();
         let s = instruction.s();
         let t = instruction.t();
@@ -716,7 +722,7 @@ impl Cpu {
     }
 
     /// Branch if Less than or Equal to Zero
-    fn op_blez(&mut self, instruction: Instruction) {
+    fn op_blez(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.imm_se();
         let s = instruction.s();
 
@@ -728,7 +734,7 @@ impl Cpu {
     }
 
     /// Branch if Greater Than Zero
-    fn op_bgtz(&mut self, instruction: Instruction) {
+    fn op_bgtz(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.imm_se();
         let s = instruction.s();
 
@@ -740,7 +746,7 @@ impl Cpu {
     }
 
     /// Add Immediate and check for signed overflow
-    fn op_addi(&mut self, instruction: Instruction) {
+    fn op_addi(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.imm_se() as i32;
         let t = instruction.t();
         let s = instruction.s();
@@ -754,7 +760,7 @@ impl Cpu {
     }
 
     /// Add Immediate Unsigned
-    fn op_addiu(&mut self, instruction: Instruction) {
+    fn op_addiu(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.imm_se();
         let t = instruction.t();
         let s = instruction.s();
@@ -765,7 +771,7 @@ impl Cpu {
     }
 
     /// Set if Less Than Immediate (signed)
-    fn op_slti(&mut self, instruction: Instruction) {
+    fn op_slti(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.imm_se() as i32;
         let s = instruction.s();
         let t = instruction.t();
@@ -776,7 +782,7 @@ impl Cpu {
     }
 
     /// Set if Less Than Immediate Unsigned
-    fn op_sltiu(&mut self, instruction: Instruction) {
+    fn op_sltiu(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.imm_se();
         let s = instruction.s();
         let t = instruction.t();
@@ -787,7 +793,7 @@ impl Cpu {
     }
 
     /// Bitwise And Immediate
-    fn op_andi(&mut self, instruction: Instruction) {
+    fn op_andi(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.imm();
         let t = instruction.t();
         let s = instruction.s();
@@ -798,7 +804,7 @@ impl Cpu {
     }
 
     /// Bitwise Or Immediate
-    fn op_ori(&mut self, instruction: Instruction) {
+    fn op_ori(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.imm();
         let t = instruction.t();
         let s = instruction.s();
@@ -809,7 +815,7 @@ impl Cpu {
     }
 
     /// Bitwise eXclusive Or Immediate
-    fn op_xori(&mut self, instruction: Instruction) {
+    fn op_xori(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.imm();
         let t = instruction.t();
         let s = instruction.s();
@@ -820,7 +826,7 @@ impl Cpu {
     }
 
     /// Load Upper Immediate
-    fn op_lui(&mut self, instruction: Instruction) {
+    fn op_lui(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let i = instruction.imm();
         let t = instruction.t();
 
@@ -831,32 +837,34 @@ impl Cpu {
     }
 
     /// Coprocessor 0 opcode
-    fn op_cop0(&mut self, instruction: Instruction) {
+    fn op_cop0(&mut self,
+               timekeeper: &mut TimeKeeper,
+               instruction: Instruction) {
         match instruction.cop_opcode() {
-            0b00000 => self.op_mfc0(instruction),
-            0b00100 => self.op_mtc0(instruction),
-            0b10000 => self.op_rfe(instruction),
+            0b00000 => self.op_mfc0(timekeeper, instruction),
+            0b00100 => self.op_mtc0(timekeeper, instruction),
+            0b10000 => self.op_rfe(timekeeper, instruction),
             _       => panic!("unhandled cop0 instruction {}", instruction)
         }
     }
 
     /// Coprocessor 1 opcode (does not exist on the Playstation)
-    fn op_cop1(&mut self, _: Instruction) {
+    fn op_cop1(&mut self, _: &mut TimeKeeper, _: Instruction) {
         self.exception(Exception::CoprocessorError);
     }
 
     /// Coprocessor 2 opcode (GTE)
-    fn op_cop2(&mut self, instruction: Instruction) {
+    fn op_cop2(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         panic!("unhandled GTE instruction: {}", instruction);
     }
 
     /// Coprocessor 3 opcode (does not exist on the Playstation)
-    fn op_cop3(&mut self, _: Instruction) {
+    fn op_cop3(&mut self, _: &mut TimeKeeper, _: Instruction) {
         self.exception(Exception::CoprocessorError);
     }
 
     /// Move From Coprocessor 0
-    fn op_mfc0(&mut self, instruction: Instruction) {
+    fn op_mfc0(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let cpu_r = instruction.t();
         let cop_r = instruction.d().0;
 
@@ -872,7 +880,7 @@ impl Cpu {
     }
 
     /// Move To Coprocessor 0
-    fn op_mtc0(&mut self, instruction: Instruction) {
+    fn op_mtc0(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         let cpu_r = instruction.t();
         let cop_r = instruction.d().0;
 
@@ -893,7 +901,7 @@ impl Cpu {
     }
 
     /// Return From Exception
-    fn op_rfe(&mut self, instruction: Instruction) {
+    fn op_rfe(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         // There are other instructions with the same encoding but all
         // are virtual memory related and the Playstation doesn't
         // implement them. Still, let's make sure we're not running
@@ -910,7 +918,9 @@ impl Cpu {
     }
 
     /// Load Byte (signed)
-    fn op_lb(&mut self, instruction: Instruction) {
+    fn op_lb(&mut self,
+             timekeeper: &mut TimeKeeper,
+             instruction: Instruction) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -919,14 +929,16 @@ impl Cpu {
         let addr = self.reg(s).wrapping_add(i);
 
         // Cast as i8 to force sign extension
-        let v = self.load8(addr) as i8;
+        let v = self.load8(timekeeper, addr) as i8;
 
         // Put the load in the delay slot
         self.load = (t, v as u32);
     }
 
     /// Load Halfword (signed)
-    fn op_lh(&mut self, instruction: Instruction) {
+    fn op_lh(&mut self,
+             timekeeper: &mut TimeKeeper,
+             instruction: Instruction) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -935,14 +947,16 @@ impl Cpu {
         let addr = self.reg(s).wrapping_add(i);
 
         // Cast as i16 to force sign extension
-        let v = self.load16(addr) as i16;
+        let v = self.load16(timekeeper, addr) as i16;
 
         // Put the load in the delay slot
         self.load = (t, v as u32);
     }
 
     /// Load Word Left (little-endian only implementation)
-    fn op_lwl(&mut self, instruction: Instruction) {
+    fn op_lwl(&mut self,
+              timekeeper: &mut TimeKeeper,
+              instruction: Instruction) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -958,7 +972,7 @@ impl Cpu {
         // Next we load the *aligned* word containing the first
         // addressed byte
         let aligned_addr = addr & !3;
-        let aligned_word = self.load32(aligned_addr);
+        let aligned_word = self.load32(timekeeper, aligned_addr);
 
         // Depending on the address alignment we fetch the 1, 2, 3 or
         // 4 *most* significant bytes and put them in the target
@@ -976,7 +990,9 @@ impl Cpu {
     }
 
     /// Load Word
-    fn op_lw(&mut self, instruction: Instruction) {
+    fn op_lw(&mut self,
+             timekeeper: &mut TimeKeeper,
+             instruction: Instruction) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -986,7 +1002,7 @@ impl Cpu {
 
         // Address must be 32bit aligned
         if addr % 4 == 0 {
-            let v = self.load32(addr);
+            let v = self.load32(timekeeper, addr);
 
             // Put the load in the delay slot
             self.load = (t, v);
@@ -996,7 +1012,9 @@ impl Cpu {
     }
 
     /// Load Byte Unsigned
-    fn op_lbu(&mut self, instruction: Instruction) {
+    fn op_lbu(&mut self,
+              timekeeper: &mut TimeKeeper,
+              instruction: Instruction) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1004,14 +1022,16 @@ impl Cpu {
 
         let addr = self.reg(s).wrapping_add(i);
 
-        let v = self.load8(addr);
+        let v = self.load8(timekeeper, addr);
 
         // Put the load in the delay slot
         self.load = (t, v as u32);
     }
 
     /// Load Halfword Unsigned
-    fn op_lhu(&mut self, instruction: Instruction) {
+    fn op_lhu(&mut self,
+              timekeeper: &mut TimeKeeper,
+              instruction: Instruction) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1021,7 +1041,7 @@ impl Cpu {
 
         // Address must be 16bit aligned
         if addr % 2 == 0 {
-            let v = self.load16(addr);
+            let v = self.load16(timekeeper, addr);
 
             // Put the load in the delay slot
             self.load = (t, v as u32);
@@ -1031,7 +1051,9 @@ impl Cpu {
     }
 
     /// Load Word Right (little-endian only implementation)
-    fn op_lwr(&mut self, instruction: Instruction) {
+    fn op_lwr(&mut self,
+              timekeeper: &mut TimeKeeper,
+              instruction: Instruction) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1047,7 +1069,7 @@ impl Cpu {
         // Next we load the *aligned* word containing the first
         // addressed byte
         let aligned_addr = addr & !3;
-        let aligned_word = self.load32(aligned_addr);
+        let aligned_word = self.load32(timekeeper, aligned_addr);
 
         // Depending on the address alignment we fetch the 1, 2, 3 or
         // 4 *least* significant bytes and put them in the target
@@ -1065,7 +1087,9 @@ impl Cpu {
     }
 
     /// Store Byte
-    fn op_sb(&mut self, instruction: Instruction) {
+    fn op_sb(&mut self,
+             timekeeper: &mut TimeKeeper,
+             instruction: Instruction) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1074,11 +1098,13 @@ impl Cpu {
         let addr = self.reg(s).wrapping_add(i);
         let v    = self.reg(t);
 
-        self.store8(addr, v as u8);
+        self.store8(timekeeper, addr, v as u8);
     }
 
     /// Store Halfword
-    fn op_sh(&mut self, instruction: Instruction) {
+    fn op_sh(&mut self,
+             timekeeper: &mut TimeKeeper,
+             instruction: Instruction) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1089,14 +1115,16 @@ impl Cpu {
 
         // Address must be 16bit aligned
         if addr % 2 == 0 {
-            self.store16(addr, v as u16);
+            self.store16(timekeeper, addr, v as u16);
         } else {
             self.exception(Exception::StoreAddressError);
         }
     }
 
     /// Store Word Left (little-endian only implementation)
-    fn op_swl(&mut self, instruction: Instruction) {
+    fn op_swl(&mut self,
+              timekeeper: &mut TimeKeeper,
+              instruction: Instruction) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1108,7 +1136,7 @@ impl Cpu {
         let aligned_addr = addr & !3;
         // Load the current value for the aligned word at the target
         // address
-        let cur_mem = self.load32(aligned_addr);
+        let cur_mem = self.load32(timekeeper, aligned_addr);
 
         let mem = match addr & 3 {
             0 => (cur_mem & 0xffffff00) | (v >> 24),
@@ -1118,11 +1146,15 @@ impl Cpu {
             _ => unreachable!(),
         };
 
-        self.store32(addr, mem);
+        // XXX do we really get the full latency for the full
+        // load/store sequence?
+        self.store32(timekeeper, addr, mem);
     }
 
     /// Store Word
-    fn op_sw(&mut self, instruction: Instruction) {
+    fn op_sw(&mut self,
+             timekeeper: &mut TimeKeeper,
+             instruction: Instruction) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1133,14 +1165,16 @@ impl Cpu {
 
         // Address must be 32bit aligned
         if addr % 4 == 0 {
-            self.store32(addr, v);
+            self.store32(timekeeper, addr, v);
         } else {
             self.exception(Exception::StoreAddressError);
         }
     }
 
     /// Store Word Right (little-endian only implementation)
-    fn op_swr(&mut self, instruction: Instruction) {
+    fn op_swr(&mut self,
+              timekeeper: &mut TimeKeeper,
+              instruction: Instruction) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1152,7 +1186,7 @@ impl Cpu {
         let aligned_addr = addr & !3;
         // Load the current value for the aligned word at the target
         // address
-        let cur_mem = self.load32(aligned_addr);
+        let cur_mem = self.load32(timekeeper, aligned_addr);
 
         let mem = match addr & 3 {
             0 => (cur_mem & 0x00000000) | (v << 0),
@@ -1162,51 +1196,53 @@ impl Cpu {
             _ => unreachable!(),
         };
 
-        self.store32(addr, mem);
+        // XXX do we really get the full latency for the full
+        // load/store sequence?
+        self.store32(timekeeper, addr, mem);
     }
 
     /// Load Word in Coprocessor 0
-    fn op_lwc0(&mut self, _: Instruction) {
+    fn op_lwc0(&mut self, _: &mut TimeKeeper, _: Instruction) {
         // Not supported by this coprocessor
         self.exception(Exception::CoprocessorError);
     }
 
     /// Load Word in Coprocessor 1
-    fn op_lwc1(&mut self, _: Instruction) {
+    fn op_lwc1(&mut self, _: &mut TimeKeeper, _: Instruction) {
         // Not supported by this coprocessor
         self.exception(Exception::CoprocessorError);
     }
 
     /// Load Word in Coprocessor 2
-    fn op_lwc2(&mut self, instruction: Instruction) {
+    fn op_lwc2(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         panic!("unhandled GTE LWC: {}", instruction);
     }
 
     /// Load Word in Coprocessor 3
-    fn op_lwc3(&mut self, _: Instruction) {
+    fn op_lwc3(&mut self, _: &mut TimeKeeper, _: Instruction) {
         // Not supported by this coprocessor
         self.exception(Exception::CoprocessorError);
     }
 
     /// Store Word in Coprocessor 0
-    fn op_swc0(&mut self, _: Instruction) {
+    fn op_swc0(&mut self, _: &mut TimeKeeper, _: Instruction) {
         // Not supported by this coprocessor
         self.exception(Exception::CoprocessorError);
     }
 
     /// Store Word in Coprocessor 1
-    fn op_swc1(&mut self, _: Instruction) {
+    fn op_swc1(&mut self, _: &mut TimeKeeper, _: Instruction) {
         // Not supported by this coprocessor
         self.exception(Exception::CoprocessorError);
     }
 
     /// Store Word in Coprocessor 2
-    fn op_swc2(&mut self, instruction: Instruction) {
+    fn op_swc2(&mut self, _: &mut TimeKeeper, instruction: Instruction) {
         panic!("unhandled GTE SWC: {}", instruction);
     }
 
     /// Store Word in Coprocessor 3
-    fn op_swc3(&mut self, _: Instruction) {
+    fn op_swc3(&mut self, _: &mut TimeKeeper, _: Instruction) {
         // Not supported by this coprocessor
         self.exception(Exception::CoprocessorError);
     }
@@ -1323,8 +1359,6 @@ struct RegisterIndex(u32);
 impl Debug for Cpu {
     fn fmt(&self, f: &mut Formatter) -> Result<(), Error> {
 
-        let instruction = self.load32(self.current_pc);
-
         try!(writeln!(f, "PC: {:08x}", self.current_pc));
 
         for i in 0..8 {
@@ -1349,8 +1383,8 @@ impl Debug for Cpu {
                           REGISTER_MNEMONICS[reg as usize], val));
         }
 
-        try!(writeln!(f, "Next instruction: 0x{:08x} {}",
-                      instruction, asm::decode(Instruction(instruction))));
+        // XXX Can't display next instruction because load32 requires
+        // &mut self
 
         Ok(())
     }

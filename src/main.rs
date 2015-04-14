@@ -2,6 +2,7 @@ extern crate sdl2;
 extern crate gl;
 extern crate libc;
 
+mod timekeeper;
 mod cpu;
 mod memory;
 mod gpu;
@@ -31,9 +32,11 @@ fn main() {
 
     let mut event_pump = sdl_context.event_pump();
 
+    let mut timekeeper = timekeeper::TimeKeeper::new();
+
     loop {
         for _ in 0..1_000_000 {
-            cpu.run_next_instruction();
+            cpu.run_next_instruction(&mut timekeeper);
         }
 
         // See if we should quit
