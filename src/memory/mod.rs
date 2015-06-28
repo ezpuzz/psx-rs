@@ -5,6 +5,7 @@ mod dma;
 use self::bios::Bios;
 use self::ram::Ram;
 use self::dma::{Dma, Port, Direction, Step, Sync};
+use timekeeper::TimeKeeper;
 use gpu::Gpu;
 
 /// Global interconnect
@@ -36,8 +37,25 @@ impl Interconnect {
         self.cache_control
     }
 
+    /// Interconnect: load instruction at `PC`. Only the RAM and BIOS
+    /// are supported, would it make sense to fetch instructions from
+    /// anything else?
+    pub fn load_instruction<T: Addressable>(&self, pc: u32) -> T {
+        let abs_addr = map::mask_region(pc);
+
+        if let Some(offset) = map::RAM.contains(abs_addr) {
+            return self.ram.load(offset);
+        }
+
+        if let Some(offset) = map::BIOS.contains(abs_addr) {
+            return self.bios.load(offset);
+        }
+
+        panic!("unhandled instruction load at address {:08x}", pc);
+    }
+
     /// Interconnect: load value at `addr`
-    pub fn load<T: Addressable>(&self, addr: u32) -> T {
+    pub fn load<T: Addressable>(&mut self, tk: &mut TimeKeeper,  addr: u32) -> T {
         let abs_addr = map::mask_region(addr);
 
         if let Some(offset) = map::RAM.contains(abs_addr) {
@@ -58,7 +76,7 @@ impl Interconnect {
         }
 
         if let Some(offset) = map::GPU.contains(abs_addr) {
-            return self.gpu.load(offset);
+            return self.gpu.load(tk, offset);
         }
 
         if let Some(offset) = map::TIMERS.contains(abs_addr) {

@@ -1,10 +1,14 @@
 use std::fmt::{Display, Formatter, Error};
 
 use memory::{Interconnect, Addressable, AccessWidth};
+use timekeeper::TimeKeeper;
 use debugger::Debugger;
 
 /// CPU state
 pub struct Cpu {
+    /// Struct used to keep track of each peripheral's emulation
+    /// advancement and synchronize them when needed
+    tk: TimeKeeper,
     /// The program counter register: points to the next instruction
     pc: u32,
     /// Next value for the PC, used to simulate the branch delay slot
@@ -58,6 +62,7 @@ impl Cpu {
         let pc = 0xbfc00000;
 
         Cpu {
+            tk:         TimeKeeper::new(),
             pc:         pc,
             next_pc:    pc.wrapping_add(4),
             current_pc: 0,
@@ -149,8 +154,15 @@ impl Cpu {
                 // words are going to remain invalid in the cacheline.
                 let mut cpc = pc;
 
+                // Fetching takes 3 cycles + 1 per instruction on
+                // average.
+                self.tk.tick(3);
+
                 for i in index..4 {
-                    let instruction = Instruction(self.inter.load(cpc));
+                    self.tk.tick(1);
+
+                    let instruction =
+                        Instruction(self.inter.load_instruction(cpc));
 
                     line.set_instruction(i, instruction);
                     cpc += 4;
@@ -163,8 +175,11 @@ impl Cpu {
             // Cache line is now guaranteed to be valid
             line.instruction(index)
         } else {
-            // Cache disabled, fetch directly from memory
-            Instruction(self.inter.load(pc))
+            // Cache disabled, fetch directly from memory. Takes 4
+            // cycles on average.
+            self.tk.tick(4);
+            
+            Instruction(self.inter.load_instruction(pc))
         }
     }
 
@@ -174,13 +189,13 @@ impl Cpu {
                             debugger: &mut Debugger) -> T {
         debugger.memory_read(self, addr);
 
-        self.inter.load(addr)
+        self.inter.load(&mut self.tk, addr)
     }
 
     /// Memory read with as little side-effect as possible. Used for
     /// debugging.
     pub fn examine<T: Addressable>(&mut self, addr: u32) -> T {
-        self.inter.load(addr)
+        self.inter.load(&mut self.tk, addr)
     }
 
     /// Memory write
@@ -325,6 +340,9 @@ impl Cpu {
     fn decode_and_execute(&mut self,
                           instruction: Instruction,
                           debugger: &mut Debugger) {
+        // Simulate instruction execution time.
+        self.tk.tick(1);
+
         match instruction.function() {
             0b000000 => match instruction.subfunction() {
                 0b000000 => self.op_sll(instruction),

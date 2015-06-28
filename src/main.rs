@@ -5,6 +5,7 @@ extern crate libc;
 mod cpu;
 mod memory;
 mod gpu;
+mod timekeeper;
 mod debugger;
 
 use std::path::Path;

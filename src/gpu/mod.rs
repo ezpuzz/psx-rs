@@ -1,5 +1,6 @@
 use self::opengl::{Renderer, Position, Color};
 use memory::{Addressable, AccessWidth};
+use timekeeper::{TimeKeeper, Peripheral, CpuTime};
 
 pub mod opengl;
 
@@ -88,6 +89,13 @@ pub struct Gpu {
     gp0_command_method: fn(&mut Gpu),
     /// Current mode of the GP0 register
     gp0_mode: Gp0Mode,
+    /// Fractional GPU cycle remainder resulting from the CPU
+    /// clock/GPU clock time conversion.
+    gpu_clock_frac: u16,
+    /// Currently displayed video output line
+    line: u16,
+    /// Current GPU clock tick for the current line
+    line_tick: u16,
 }
 
 impl Gpu {
@@ -132,14 +140,61 @@ impl Gpu {
             gp0_words_remaining: 0,
             gp0_command_method: Gpu::gp0_nop,
             gp0_mode: Gp0Mode::Command,
+            gpu_clock_frac: 0,
+            line: 0,
+            line_tick: 0,
         }
     }
 
-    pub fn load<T: Addressable>(&self, offset: u32) -> T {
+    fn sync(&mut self, tk: &mut TimeKeeper) {
+        let delta = tk.sync(Peripheral::Gpu);
+
+        // First we convert the delta into GPU clock periods.
+        // CPU clock in MHz
+        let cpu_clock = 33.8685f32;
+        // GPU clock in MHz
+        // XXX: PAL consoles use 53.20MHz for the GPU clock
+        let gpu_clock = 53.69f32;
+
+        // Clock ratio shifted 16bits to the left
+        let cpu_to_gpu_clock_ratio =
+            ((gpu_clock / cpu_clock) * 0x10000 as f32) as CpuTime;
+
+        // Convert delta in GPU time, adding the leftover from the
+        // last time
+        let delta = self.gpu_clock_frac as CpuTime +
+                    delta * cpu_to_gpu_clock_ratio;
+
+        // The 16 low bits are the new fractional part
+        self.gpu_clock_frac = delta as u16;
+
+        // Conwert delta back to integer
+        let delta = delta >> 16;
+
+        // Compute the current line and position within the line. The
+        // value of ticks_per_line is an estimate using the average
+        // line length recorded by the timer1 using the "hsync" clock
+        // source.
+        let (ticks_per_line, lines_per_frame) =
+            match self.vmode {
+                VMode::Ntsc => (3412, 263),
+                VMode::Pal  => (3404, 314),
+            };
+
+        let line_tick = self.line_tick as CpuTime + delta;
+        let line      = self.line as CpuTime + line_tick / ticks_per_line;
+
+        self.line_tick = (line_tick % ticks_per_line) as u16;
+        self.line      = (line % lines_per_frame) as u16;
+    }
+
+    pub fn load<T: Addressable>(&mut self, tk: &mut TimeKeeper, offset: u32) -> T {
 
         if T::width() != AccessWidth::Word {
             panic!("Unhandled {:?} GPU load", T::width());
         }
+
+        self.sync(tk);
 
         let r =
             match offset {
