@@ -1,6 +1,7 @@
 use self::opengl::{Renderer, Position, Color};
 use memory::{Addressable, AccessWidth};
 use timekeeper::{TimeKeeper, Peripheral, CpuTime};
+use HardwareType;
 
 pub mod opengl;
 
@@ -96,10 +97,12 @@ pub struct Gpu {
     line: u16,
     /// Current GPU clock tick for the current line
     line_tick: u16,
+    /// Hardware type (PAL or NTSC)
+    hardware: HardwareType,
 }
 
 impl Gpu {
-    pub fn new(renderer: opengl::Renderer) -> Gpu {
+    pub fn new(renderer: opengl::Renderer, hardware: HardwareType) -> Gpu {
         Gpu {
             renderer: renderer,
             page_base_x: 0,
@@ -143,6 +146,7 @@ impl Gpu {
             gpu_clock_frac: 0,
             line: 0,
             line_tick: 0,
+            hardware: hardware,
         }
     }
 
@@ -153,8 +157,11 @@ impl Gpu {
         // CPU clock in MHz
         let cpu_clock = 33.8685f32;
         // GPU clock in MHz
-        // XXX: PAL consoles use 53.20MHz for the GPU clock
-        let gpu_clock = 53.69f32;
+        let gpu_clock =
+            match self.hardware {
+                HardwareType::Ntsc => 53.69f32,
+                HardwareType::Pal  => 53.20f32,
+            };
 
         // Clock ratio shifted 16bits to the left
         let cpu_to_gpu_clock_ratio =
@@ -185,7 +192,15 @@ impl Gpu {
         let line      = self.line as CpuTime + line_tick / ticks_per_line;
 
         self.line_tick = (line_tick % ticks_per_line) as u16;
-        self.line      = (line % lines_per_frame) as u16;
+
+        if line > lines_per_frame {
+            self.line = (line % lines_per_frame) as u16;
+
+            /* New frame: update display */
+            self.renderer.display();
+        } else {
+            self.line = line as u16;
+        }
     }
 
     pub fn load<T: Addressable>(&mut self, tk: &mut TimeKeeper, offset: u32) -> T {
@@ -529,10 +544,6 @@ impl Gpu {
         let y = ((y << 5) as i16) >> 5;
 
         self.renderer.set_draw_offset(x, y);
-
-        // XXX Temporary hack: force display when changing offset
-        // since we don't have proper timings
-        self.renderer.display();
     }
 
     /// GP0(0xE6): Set Mask Bit Setting
