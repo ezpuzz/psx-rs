@@ -94,9 +94,9 @@ pub struct Gpu {
     /// clock/GPU clock time conversion.
     gpu_clock_frac: u16,
     /// Currently displayed video output line
-    line: u16,
+    display_line: u16,
     /// Current GPU clock tick for the current line
-    line_tick: u16,
+    display_line_tick: u16,
     /// Hardware type (PAL or NTSC)
     hardware: HardwareType,
 }
@@ -144,8 +144,8 @@ impl Gpu {
             gp0_command_method: Gpu::gp0_nop,
             gp0_mode: Gp0Mode::Command,
             gpu_clock_frac: 0,
-            line: 0,
-            line_tick: 0,
+            display_line: 0,
+            display_line_tick: 0,
             hardware: hardware,
         }
     }
@@ -188,19 +188,52 @@ impl Gpu {
                 VMode::Pal  => (3404, 314),
             };
 
-        let line_tick = self.line_tick as CpuTime + delta;
-        let line      = self.line as CpuTime + line_tick / ticks_per_line;
+        let line_tick = self.display_line_tick as CpuTime + delta;
+        let line      = self.display_line as CpuTime +
+                        line_tick / ticks_per_line;
 
-        self.line_tick = (line_tick % ticks_per_line) as u16;
+        self.display_line_tick = (line_tick % ticks_per_line) as u16;
 
         if line > lines_per_frame {
-            self.line = (line % lines_per_frame) as u16;
+            // New frame
 
-            /* New frame: update display */
+            if self.interlaced {
+                // Update the field
+                let nframes = line / lines_per_frame;
+
+                self.field =
+                    match (nframes + self.field as CpuTime) & 1 != 0 {
+                        true => Field::Top,
+                        false => Field::Bottom,
+                    }
+            }
+
+            self.display_line = (line % lines_per_frame) as u16;
+
+            // Update display
             self.renderer.display();
         } else {
-            self.line = line as u16;
+            self.display_line = line as u16;
         }
+    }
+
+    /// Return true if we're currently in the video blanking period
+    fn in_vblank(&self) -> bool {
+        self.display_line < self.display_line_start ||
+        self.display_line > self.display_line_end
+    }
+
+    /// Return the index of the currently displayed VRAM line
+    fn displayed_vram_line(&self) -> u16 {
+        let offset =
+            match self.interlaced {
+                true  => self.display_line * 2 + self.field as u16,
+                false => self.display_line,
+            };
+
+        // The VRAM "wraps around" so we in case of an overflow we
+        // simply truncate to 9bits
+        (self.display_vram_y_start + offset) & 0x1ff
     }
 
     pub fn load<T: Addressable>(&mut self, tk: &mut TimeKeeper, offset: u32) -> T {
@@ -252,9 +285,7 @@ impl Gpu {
         // Bit 14: not supported
         r |= (self.texture_disable as u32) << 15;
         r |= self.hres.into_status();
-        // XXX Temporary hack: if we don't emulate bit 31 correctly
-        // setting `vres` to 1 locks the BIOS:
-        // r |= (self.vres as u32) << 19;
+        r |= (self.vres as u32) << 19;
         r |= (self.vmode as u32) << 20;
         r |= (self.display_depth as u32) << 21;
         r |= (self.interlaced as u32) << 22;
@@ -271,10 +302,11 @@ impl Gpu {
 
         r |= (self.dma_direction as u32) << 29;
 
-        // Bit 31 should change depending on the currently drawn line
-        // (whether it's even, odd or in the vblack apparently). Let's
-        // not bother with it for now.
-        r |= 0 << 31;
+        // Bit 31 is 1 if the currently displayed VRAM line is odd, 0
+        // if it's even or if we're in the vertical blanking.
+        if !self.in_vblank() {
+            r |= ((self.displayed_vram_line() & 1) as u32) << 31
+        }
 
         // Not sure about that, I'm guessing that it's the signal
         // checked by the DMA in when sending data in Request
@@ -601,6 +633,7 @@ impl Gpu {
         self.display_vram_y_start = 0;
         self.hres = HorizontalRes::from_fields(0, 0);
         self.vres = VerticalRes::Y240Lines;
+        self.field = Field::Top;
 
         // XXX does PAL hardware reset to this config as well?
         self.vmode = VMode::Ntsc;
@@ -610,6 +643,8 @@ impl Gpu {
         self.display_line_start = 0x10;
         self.display_line_end = 0x100;
         self.display_depth = DisplayDepth::D15Bits;
+        self.display_line = 0;
+        self.display_line_tick = 0;
 
         self.renderer.set_draw_offset(0, 0);
 
@@ -693,6 +728,8 @@ impl Gpu {
             };
 
         self.interlaced = val & 0x20 != 0;
+        // XXX Not sure if I should reset field here
+        self.field = Field::Top;
 
         if val & 0x80 != 0 {
             panic!("Unsupported display mode {:08x}", val);
