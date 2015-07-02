@@ -55,7 +55,9 @@ impl Interconnect {
     }
 
     /// Interconnect: load value at `addr`
-    pub fn load<T: Addressable>(&mut self, tk: &mut TimeKeeper,  addr: u32) -> T {
+    pub fn load<T: Addressable>(&mut self,
+                                tk: &mut TimeKeeper,
+                                addr: u32) -> T {
         let abs_addr = map::mask_region(addr);
 
         if let Some(offset) = map::RAM.contains(abs_addr) {
@@ -100,7 +102,10 @@ impl Interconnect {
     }
 
     /// Interconnect: store `val` into `addr`
-    pub fn store<T: Addressable>(&mut self, addr: u32, val: T) {
+    pub fn store<T: Addressable>(&mut self,
+                                 tk: &mut TimeKeeper,
+                                 addr: u32,
+                                 val: T) {
 
         let abs_addr = map::mask_region(addr);
 
@@ -118,7 +123,7 @@ impl Interconnect {
         }
 
         if let Some(offset) = map::GPU.contains(abs_addr) {
-            return self.gpu.store(offset, val);
+            return self.gpu.store(tk, offset, val);
         }
 
         if let Some(offset) = map::TIMERS.contains(abs_addr) {

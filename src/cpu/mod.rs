@@ -208,7 +208,7 @@ impl Cpu {
         if self.sr.cache_isolated() {
             self.cache_maintenance(addr, val);
         } else {
-            self.inter.store(addr, val);
+            self.inter.store(&mut self.tk, addr, val);
         }
     }
 

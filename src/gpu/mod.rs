@@ -1,6 +1,6 @@
 use self::opengl::{Renderer, Position, Color};
 use memory::{Addressable, AccessWidth};
-use timekeeper::{TimeKeeper, Peripheral, CpuTime};
+use timekeeper::{TimeKeeper, Peripheral, Cycles};
 use HardwareType;
 
 pub mod opengl;
@@ -150,9 +150,7 @@ impl Gpu {
         }
     }
 
-    fn sync(&mut self, tk: &mut TimeKeeper) {
-        let delta = tk.sync(Peripheral::Gpu);
-
+    fn gpu_to_cpu_clock_ratio(&self) -> Cycles {
         // First we convert the delta into GPU clock periods.
         // CPU clock in MHz
         let cpu_clock = 33.8685f32;
@@ -164,13 +162,16 @@ impl Gpu {
             };
 
         // Clock ratio shifted 16bits to the left
-        let cpu_to_gpu_clock_ratio =
-            ((gpu_clock / cpu_clock) * 0x10000 as f32) as CpuTime;
+        ((gpu_clock / cpu_clock) * 0x10000 as f32) as Cycles
+    }
+
+    fn sync(&mut self, tk: &mut TimeKeeper) {
+        let delta = tk.sync(Peripheral::Gpu);
 
         // Convert delta in GPU time, adding the leftover from the
         // last time
-        let delta = self.gpu_clock_frac as CpuTime +
-                    delta * cpu_to_gpu_clock_ratio;
+        let delta = self.gpu_clock_frac as Cycles +
+                    delta * self.gpu_to_cpu_clock_ratio();
 
         // The 16 low bits are the new fractional part
         self.gpu_clock_frac = delta as u16;
@@ -188,8 +189,8 @@ impl Gpu {
                 VMode::Pal  => (3404, 314),
             };
 
-        let line_tick = self.display_line_tick as CpuTime + delta;
-        let line      = self.display_line as CpuTime +
+        let line_tick = self.display_line_tick as Cycles + delta;
+        let line      = self.display_line as Cycles +
                         line_tick / ticks_per_line;
 
         self.display_line_tick = (line_tick % ticks_per_line) as u16;
@@ -202,8 +203,8 @@ impl Gpu {
                 let nframes = line / lines_per_frame;
 
                 self.field =
-                    match (nframes + self.field as CpuTime) & 1 != 0 {
-                        true => Field::Top,
+                    match (nframes + self.field as Cycles) & 1 != 0 {
+                        true  => Field::Top,
                         false => Field::Bottom,
                     }
             }
@@ -236,7 +237,9 @@ impl Gpu {
         (self.display_vram_y_start + offset) & 0x1ff
     }
 
-    pub fn load<T: Addressable>(&mut self, tk: &mut TimeKeeper, offset: u32) -> T {
+    pub fn load<T: Addressable>(&mut self,
+                                tk: &mut TimeKeeper,
+                                offset: u32) -> T {
 
         if T::width() != AccessWidth::Word {
             panic!("Unhandled {:?} GPU load", T::width());
@@ -254,11 +257,16 @@ impl Gpu {
         Addressable::from_u32(r)
     }
 
-    pub fn store<T: Addressable>(&mut self, offset: u32, val: T) {
+    pub fn store<T: Addressable>(&mut self,
+                                 tk: &mut TimeKeeper,
+                                 offset: u32,
+                                 val: T) {
 
         if T::width() != AccessWidth::Word {
             panic!("Unhandled {:?} GPU load", T::width());
         }
+
+        self.sync(tk);
 
         let val = val.as_u32();
 

@@ -2,7 +2,7 @@
 pub struct TimeKeeper {
     /// Counter keeping track of the current date. Unit is a period of
     /// the CPU clock at 33.8685MHz (~29.5ns)
-    now: CpuTime,
+    now: Cycles,
     /// Time sheets for keeping track of the various peripherals
     timesheets: [TimeSheet; 1],
 }
@@ -15,13 +15,13 @@ impl TimeKeeper {
         }
     }
 
-    pub fn tick(&mut self, cycles: CpuTime) {
+    pub fn tick(&mut self, cycles: Cycles) {
         self.now += cycles;
     }
 
     /// Synchronize the timesheet for the given peripheral and return
     /// the elapsed time synce the last sync.
-    pub fn sync(&mut self, who: Peripheral) -> CpuTime {
+    pub fn sync(&mut self, who: Peripheral) -> Cycles {
         self.timesheets[who as usize].sync(self.now)
     }
 }
@@ -30,7 +30,7 @@ impl TimeKeeper {
 /// Struct used to keep track of individual peripherals
 struct TimeSheet {
     /// Date of the last synchronization
-    last: CpuTime,
+    last: Cycles,
 }
 
 impl TimeSheet {
@@ -43,7 +43,7 @@ impl TimeSheet {
 
     /// Forward the time sheet to the current date and return the
     /// elapsed time since the last sync.
-    fn sync(&mut self, now: CpuTime) -> CpuTime {
+    fn sync(&mut self, now: Cycles) -> Cycles {
         let delta = now - self.last;
 
         self.last = now;
@@ -61,4 +61,4 @@ pub enum Peripheral {
 
 /// 64bit timestamps will wrap in roughly 17271 years with a CPU clock
 /// at 33.8685MHz so it should be plenty enough.
-pub type CpuTime = u64;
+pub type Cycles = u64;
