@@ -1,4 +1,10 @@
+use shared::SharedState;
+use interrupt::Interrupt;
+
+use tracer::SizedValue;
+
 /// Direct Memory Access
+#[derive(RustcDecodable, RustcEncodable)]
 pub struct Dma {
     /// DMA control register
     control: u32,
@@ -65,12 +71,18 @@ impl Dma {
     }
 
     /// Set the value of the interrupt register
-    pub fn set_interrupt(&mut self, val: u32) {
+    pub fn set_interrupt(&mut self,
+                         shared: &mut SharedState,
+                         val: u32) {
+        let prev_irq = self.irq();
+
         // Unknown what bits [5:0] do
         self.irq_dummy = (val & 0x3f) as u8;
 
         self.force_irq = (val >> 15) & 1 != 0;
 
+        // XXX I don't think disabling the channel IRQ clears the
+        // interrupt in channel_irq_flags but I should check that.
         self.channel_irq_en = ((val >> 16) & 0x7f) as u8;
 
         self.irq_en = (val >> 23) & 1 != 0;
@@ -79,7 +91,10 @@ impl Dma {
         let ack = ((val >> 24) & 0x3f) as u8;
         self.channel_irq_flags &= !ack;
 
-        println!("DMA IRQ en: {} {:08x}", self.irq_en, val);
+        if !prev_irq && self.irq() {
+            // Rising edge of the done interrupt
+            shared.irq_state_mut().assert(Interrupt::Dma);
+        }
     }
 
     /// Return a reference to a channel by port number.
@@ -91,11 +106,30 @@ impl Dma {
     pub fn channel_mut(&mut self, port: Port) -> &mut Channel {
         &mut self.channels[port as usize]
     }
+
+    pub fn done(&mut self,
+                shared: &mut SharedState,
+                port: Port) {
+
+        self.channel_mut(port).done();
+
+        let prev_irq = self.irq();
+
+        // Set interrupt flag if the channel's interrupt is enabled
+        let it_en = self.channel_irq_en & (1 << (port as usize));
+
+        self.channel_irq_flags |= it_en;
+
+        if !prev_irq && self.irq() {
+            // Rising edge of the done interrupt
+            shared.irq_state_mut().assert(Interrupt::Dma);
+        }
+    }
 }
 
 /// Per-channel data
-#[derive(Clone,Copy)]
-struct Channel {
+#[derive(Clone, Copy, RustcDecodable, RustcEncodable)]
+pub struct Channel {
     /// If true the channel is enabled and the copy can take place
     /// depending on the condition mandated by the `sync` mode.
     enable: bool,
@@ -229,12 +263,9 @@ impl Channel {
     }
 
     /// Set the channel status to "completed" state
-    pub fn done(&mut self) {
+    fn done(&mut self) {
         self.enable = false;
         self.trigger = false;
-
-        // XXX Need to set the correct value for the other fields (in
-        // particular interrupts)
     }
 
     pub fn direction(&self) -> Direction {
@@ -269,21 +300,21 @@ impl Channel {
 }
 
 /// DMA transfer direction
-#[derive(Clone,Copy,PartialEq,Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, RustcDecodable, RustcEncodable)]
 pub enum Direction {
     ToRam   = 0,
     FromRam = 1,
 }
 
 /// DMA transfer step
-#[derive(Clone,Copy)]
+#[derive(Clone, Copy, RustcDecodable, RustcEncodable)]
 pub enum Step {
     Increment = 0,
     Decrement = 1,
 }
 
 /// DMA transfer synchronization mode
-#[derive(Clone,Copy)]
+#[derive(Clone, Copy, RustcDecodable, RustcEncodable)]
 pub enum Sync {
     /// Transfer starts when the CPU writes to the Trigger bit and
     /// transfers everything at once
@@ -294,13 +325,19 @@ pub enum Sync {
     LinkedList = 2,
 }
 
+impl From<Sync> for SizedValue {
+    fn from(v: Sync) -> SizedValue {
+        SizedValue(v as u32, 2)
+    }
+}
+
 /// The 7 DMA ports
-#[derive(Clone,Copy,PartialEq,Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, RustcDecodable, RustcEncodable)]
 pub enum Port {
     /// Macroblock decoder input
-    MdecIn = 0,
+    MDecIn = 0,
     /// Macroblock decoder output
-    MdecOut = 1,
+    MDecOut = 1,
     /// Graphics Processing Unit
     Gpu = 2,
     /// CD-ROM drive
@@ -316,8 +353,8 @@ pub enum Port {
 impl Port {
     pub fn from_index(index: u32) -> Port {
         match index {
-            0 => Port::MdecIn,
-            1 => Port::MdecOut,
+            0 => Port::MDecIn,
+            1 => Port::MDecOut,
             2 => Port::Gpu,
             3 => Port::CdRom,
             4 => Port::Spu,
@@ -325,5 +362,11 @@ impl Port {
             6 => Port::Otc,
             n => panic!("Invalid port {}", n),
         }
+    }
+}
+
+impl From<Port> for SizedValue {
+    fn from(v: Port) -> SizedValue {
+        SizedValue(v as u32, 3)
     }
 }

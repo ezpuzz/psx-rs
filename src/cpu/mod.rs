@@ -1,9 +1,25 @@
+mod cop0;
+mod gte;
+
+#[cfg(test)]
+mod tests;
+
 use std::fmt::{Display, Formatter, Error};
+use std::default::Default;
 
-use memory::{Interconnect, Addressable, AccessWidth};
+use memory::{Interconnect, Addressable, Byte, HalfWord, Word};
+use shared::SharedState;
+use gpu::renderer::Renderer;
+use interrupt::InterruptState;
 use debugger::Debugger;
+use tracer::module_tracer;
 
-/// CPU state
+use self::cop0::{Cop0, Exception};
+use self::gte::Gte;
+
+/// This struct contains the CPU state, including the `Interconnect`
+/// instance which owns most of the peripherals.
+#[derive(RustcDecodable, RustcEncodable)]
 pub struct Cpu {
     /// The program counter register: points to the next instruction
     pc: u32,
@@ -14,10 +30,6 @@ pub struct Cpu {
     current_pc: u32,
     /// General Purpose Registers. The first entry must always contain 0
     regs: [u32; 32],
-    /// 2nd set of registers used to emulate the load delay slot
-    /// accurately. They contain the output of the current
-    /// instruction.
-    out_regs: [u32; 32],
     /// HI register for division remainder and multiplication high
     /// result
     hi: u32,
@@ -25,15 +37,13 @@ pub struct Cpu {
     /// result
     lo: u32,
     /// Instruction Cache (256 4-word cachelines)
-    icache: [ICacheLine; 0x100],
+    icache: ICacheLines,
     /// Memory interface
     inter: Interconnect,
-    /// Cop0 register 12: Status Register
-    sr: StatusRegister,
-    /// Cop0 register 13: Cause Register
-    cause: u32,
-    /// Cop0 register 14: EPC
-    epc: u32,
+    /// Coprocessor 0: System control
+    cop0: Cop0,
+    /// Coprocessor 2: Geometry Transform Engine
+    gte: Gte,
     /// Load initiated by the current instruction (will take effect
     /// after the load delay slot)
     load: (RegisterIndex, u32),
@@ -42,10 +52,12 @@ pub struct Cpu {
     branch: bool,
     /// Set if the current instruction executes in the delay slot
     delay_slot: bool,
+    /// If `true` break instructions will trigger the debugger instead
+    /// of generating an exception.
+    debug_on_break: bool,
 }
 
 impl Cpu {
-
     /// Create a new CPU instance
     pub fn new(inter: Interconnect) -> Cpu {
         // Not sure what the reset values are...
@@ -58,27 +70,64 @@ impl Cpu {
         let pc = 0xbfc00000;
 
         Cpu {
-            pc:         pc,
-            next_pc:    pc.wrapping_add(4),
-            current_pc: 0,
-            regs:       regs,
-            out_regs:   regs,
-            hi:         0xdeadbeef,
-            lo:         0xdeadbeef,
-            icache:     [ICacheLine::new(); 0x100],
-            inter:      inter,
-            sr:         StatusRegister(0),
-            cause:      0,
-            epc:        0,
-            load:       (RegisterIndex(0), 0),
-            branch:     false,
-            delay_slot: false,
+            pc:             pc,
+            next_pc:        pc.wrapping_add(4),
+            current_pc:     0,
+            regs:           regs,
+            hi:             0xdeadbeef,
+            lo:             0xdeadbeef,
+            icache:         ICacheLines::new(),
+            inter:          inter,
+            cop0:           Cop0::new(),
+            gte:            Gte::new(),
+            load:           (RegisterIndex(0), 0),
+            branch:         false,
+            delay_slot:     false,
+            debug_on_break: false,
+        }
+    }
+
+    pub fn set_debug_on_break(&mut self, enabled: bool) {
+        self.debug_on_break = enabled
+    }
+
+    /// Return a reference to the interconnect
+    pub fn interconnect(&self) -> &Interconnect {
+        &self.inter
+    }
+
+    /// Return a mutable reference to the interconnect
+    pub fn interconnect_mut(&mut self) -> &mut Interconnect {
+        &mut self.inter
+    }
+
+    /// Run the emulator until the start of the next frame
+    pub fn run_until_next_frame<D>(&mut self,
+                                   debugger: &mut D,
+                                   shared: &mut SharedState,
+                                   renderer: &mut Renderer)
+        where D: Debugger {
+        let frame = shared.counters().frame.get();
+
+        while frame == shared.counters().frame.get() {
+            self.run_next_instruction(debugger, shared, renderer);
         }
     }
 
     /// Run a single CPU instruction and return
-    pub fn run_next_instruction(&mut self, debugger: &mut Debugger) {
-        // Save the address of the current instruction to save in
+    pub fn run_next_instruction<D>(&mut self,
+                                   debugger: &mut D,
+                                   shared: &mut SharedState,
+                                   renderer: &mut Renderer)
+        where D: Debugger {
+
+        // Synchronize the peripherals
+        if shared.tk().sync_pending() {
+            self.inter.sync(shared);
+            shared.tk().update_sync_pending();
+        }
+
+        // Save the address of the current instruction to store in
         // `EPC` in case of an exception.
         self.current_pc = self.pc;
 
@@ -92,7 +141,7 @@ impl Cpu {
         }
 
         // Fetch instruction at PC
-        let instruction = self.fetch_instruction();
+        let instruction = self.fetch_instruction(shared);
 
         // Increment PC to point to the next instruction. and
         // `next_pc` to the one after that. Both values can be
@@ -101,39 +150,71 @@ impl Cpu {
         self.pc         = self.next_pc;
         self.next_pc    = self.pc.wrapping_add(4);
 
-        // Execute the pending load (if any, otherwise it will load
-        // `R0` which is a NOP). `set_reg` works only on `out_regs` so
-        // this operation won't be visible by the next instruction.
-        let (reg, val) = self.load;
-        self.set_reg(reg, val);
-
-        // We reset the load to target register 0 for the next
-        // instruction
-        self.load = (RegisterIndex(0), 0);
-
         // If the last instruction was a branch then we're in the
         // delay slot
         self.delay_slot = self.branch;
         self.branch     = false;
 
-        self.decode_and_execute(instruction, debugger);
+        // Check for pending interrupts
+        if self.cop0.irq_active(*shared.irq_state()) {
+            shared.counters_mut().cpu_interrupt.increment();
 
-        // Copy the output registers as input for the next instruction
-        self.regs = self.out_regs;
+            module_tracer("CPU", |m| {
+                let now = shared.tk().now();
+
+                m.trace(now,
+                        "irq_count",
+                        shared.counters_mut().cpu_interrupt.get());
+                m.trace(now,
+                        "irq_pc",
+                        self.current_pc);
+            });
+
+            if instruction.is_gte_op() {
+                // GTE instructions get executed even if an interrupt
+                // occurs
+                self.decode_and_execute(debugger,
+                                        instruction,
+                                        shared,
+                                        renderer);
+            }
+
+            // XXX No idea how long the interrupt switch takes on the
+            // real hardware?
+            shared.tk().tick(1);
+
+            self.exception(Exception::Interrupt);
+        } else {
+            // No interrupt pending, run the current instruction
+            self.decode_and_execute(debugger, instruction, shared, renderer);
+        }
+    }
+
+    /// Force the value of the PC
+    pub fn set_pc(&mut self, pc: u32) {
+        self.pc = pc;
+        self.next_pc = pc.wrapping_add(4);
     }
 
     /// Fetch the instruction at `current_pc` through the instruction
     /// cache
-    fn fetch_instruction(&mut self) -> Instruction {
+    fn fetch_instruction(&mut self, shared: &mut SharedState) -> Instruction {
         let pc = self.current_pc;
         let cc = self.inter.cache_control();
 
-        // KSEG1 region is never cached
-        let kseg1 = (pc & 0xe0000000) == 0xa0000000;
+        // KUSEG and KSEG0 regions are cached. KSEG1 is uncached and
+        // KSEG2 doesn't contain any code
+        let cached = pc < 0xa0000000;
 
-        if !kseg1 && cc.icache_enabled() {
-            // Cache tag: bits [31:12]
-            let tag  = pc & 0xfffff000;
+        if cached && cc.icache_enabled() {
+            // The MSB is ignored: running from KUSEG or KSEG0 hits
+            // the same cachelines. So for instance addresses
+            // 0x00000000 and 0x80000000 have the same tag and you can
+            // jump from one to the other without having to reload the
+            // cache.
+
+            // Cache tag: bits [30:12]
+            let tag  = pc & 0x7ffff000;
             // Cache line "bucket": bits [11:4]
             let line = (pc >> 4) & 0xff;
             // Index in the cache line: bits [3:2]
@@ -149,8 +230,17 @@ impl Cpu {
                 // words are going to remain invalid in the cacheline.
                 let mut cpc = pc;
 
+                // XXX Fetch timings from mednafen, on my console it
+                // seems a bit faster than that, need to review those
+                // timings when I decide to implement CPU pipelining
+                // and whatnot
+                shared.tk().tick(3);
+
                 for i in index..4 {
-                    let instruction = Instruction(self.inter.load(cpc));
+                    shared.tk().tick(1);
+
+                    let instruction =
+                        Instruction(self.inter.load_instruction(shared, cpc));
 
                     line.set_instruction(i, instruction);
                     cpc += 4;
@@ -163,42 +253,67 @@ impl Cpu {
             // Cache line is now guaranteed to be valid
             line.instruction(index)
         } else {
-            // Cache disabled, fetch directly from memory
-            Instruction(self.inter.load(pc))
+            // XXX Apparently pointing the PC to KSEG2 causes a bus
+            // error no matter what, even if you point it at some
+            // valid register address (like the "cache control"
+            // register). Not like it should happen anyway, there's
+            // nowhere to put code in KSEG2, only a bunch of
+            // registers.
+
+            // Cache disabled, fetch directly from memory. Takes 4 to
+            // 5 cycles on average.
+            shared.tk().tick(4);
+
+            Instruction(self.inter.load_instruction(shared, pc))
         }
     }
 
     /// Memory read
-    fn load<T: Addressable>(&mut self,
-                            addr: u32,
-                            debugger: &mut Debugger) -> T {
+    fn load<A, D>(&mut self,
+                  debugger: &mut D,
+                  shared: &mut SharedState,
+                  addr: u32) -> u32
+    where A: Addressable, D: Debugger {
         debugger.memory_read(self, addr);
 
-        self.inter.load(addr)
+        self.inter.load::<A>(shared, addr)
     }
 
     /// Memory read with as little side-effect as possible. Used for
     /// debugging.
-    pub fn examine<T: Addressable>(&mut self, addr: u32) -> T {
-        self.inter.load(addr)
+    pub fn examine<A: Addressable>(&mut self, addr: u32) -> u32 {
+
+        self.inter.load::<A>(&mut SharedState::new(), addr)
     }
 
     /// Memory write
-    fn store<T: Addressable>(&mut self,
-                             addr: u32,
-                             val: T,
-                             debugger: &mut Debugger) {
+    ///
+    /// We always pass around 32bit values even for Byte and HalfWord
+    /// access because some devices ignore the requested width when
+    /// writing to their registers and might use more than what we
+    /// expect.
+    ///
+    /// On the real console the CPU always puts the entire 32bit register
+    /// value on the bus so those devices might end up using all the
+    /// bytes in the Word even for smaller widths.
+    fn store<A, D>(&mut self,
+                   debugger: &mut D,
+                   shared: &mut SharedState,
+                   renderer: &mut Renderer,
+                   addr: u32,
+                   val: u32)
+    where A: Addressable, D: Debugger {
         debugger.memory_write(self, addr);
 
-        if self.sr.cache_isolated() {
-            self.cache_maintenance(addr, val);
+        if self.cop0.cache_isolated() {
+            self.cache_maintenance::<A>(addr, val);
         } else {
-            self.inter.store(addr, val);
+            self.inter.store::<A>(shared, renderer, addr, val);
         }
     }
 
     /// Handle writes when the cache is isolated
-    pub fn cache_maintenance<T: Addressable>(&mut self, addr: u32, val: T) {
+    pub fn cache_maintenance<A: Addressable>(&mut self, addr: u32, val: u32) {
         // Implementing full cache emulation requires handling many
         // corner cases. For now I'm just going to add support for
         // cache invalidation which is the only use case for cache
@@ -210,9 +325,9 @@ impl Cpu {
             panic!("Cache maintenance while instruction cache is disabled");
         }
 
-        if T::width() != AccessWidth::Word || val.as_u32() != 0 {
+        if A::size() != 4 || val != 0 {
             panic!("Unsupported write while cache is isolated: {:08x}",
-                   val.as_u32());
+                   val);
         }
 
         let line = (addr >> 4) & 0xff;
@@ -228,7 +343,7 @@ impl Cpu {
             // Otherwise the write ends up directly in the cache.
             let index = (addr >> 2) & 3;
 
-            let instruction = Instruction(val.as_u32());
+            let instruction = Instruction(val);
 
             line.set_instruction(index, instruction);
         }
@@ -248,38 +363,60 @@ impl Cpu {
 
     /// Trigger an exception
     fn exception(&mut self, cause: Exception) {
+
         // Update the status register
-        self.sr.enter_exception();
-
-        // Update `CAUSE` register with the exception code (bits
-        // [6:2])
-        self.cause = (cause as u32) << 2;
-
-        // Save current instruction address in `EPC`
-        self.epc = self.current_pc;
-
-        if self.delay_slot {
-            // When an exception occurs in a delay slot `EPC` points
-            // to the branch instruction and bit 31 of `CAUSE` is set.
-            self.epc = self.epc.wrapping_sub(4);
-            self.cause |= 1 << 31;
-        }
+        let handler_addr =
+            self.cop0.enter_exception(cause,
+                                      self.current_pc,
+                                      self.delay_slot);
 
         // Exceptions don't have a branch delay, we jump directly into
         // the handler
-        self.pc      = self.sr.exception_handler();
+        self.pc      = handler_addr;
         self.next_pc = self.pc.wrapping_add(4);
     }
 
+    /// Retrieve the value of a general purpose register
     fn reg(&self, index: RegisterIndex) -> u32 {
         self.regs[index.0 as usize]
     }
 
+    /// Set the value of a general purpose register
     fn set_reg(&mut self, index: RegisterIndex, val: u32) {
-        self.out_regs[index.0 as usize] = val;
+        self.regs[index.0 as usize] = val;
 
         // Make sure R0 is always 0
-        self.out_regs[0] = 0;
+        self.regs[0] = 0;
+    }
+
+    /// Execute any pending delayed load. Should be called *after* the
+    /// input registers are read but *before* the output registers are
+    /// written
+    fn delayed_load(&mut self) {
+        let (reg, val) = self.load;
+
+        self.set_reg(reg, val);
+
+        // We reset the load to target register 0 for the next
+        // instruction
+        self.load = (RegisterIndex(0), 0);
+    }
+
+    /// Execute the pending delayed and setup the next one. If the new
+    /// load targets the same register as the current one then the
+    /// older one is cancelled (i.e. it never makes it to the
+    /// register).
+    ///
+    /// This method should be used instead of `delayed_load` for
+    /// instructions that setup a delayed load.
+    fn delayed_load_chain(&mut self, reg: RegisterIndex, val: u32) {
+        let (pending_reg, pending_val) = self.load;
+
+        if pending_reg != reg {
+            self.set_reg(pending_reg, pending_val);
+        }
+
+        self.load = (reg, val);
     }
 
     /// Get the value of all general purpose registers
@@ -288,7 +425,7 @@ impl Cpu {
     }
 
     pub fn sr(&self) -> u32 {
-        self.sr.as_u32()
+        self.cop0.sr()
     }
 
     pub fn lo(&self) -> u32 {
@@ -303,8 +440,8 @@ impl Cpu {
         self.pc
     }
 
-    pub fn cause(&self) -> u32 {
-        self.cause
+    pub fn cause(&self, irq_state: InterruptState) -> u32 {
+        self.cop0.cause(irq_state)
     }
 
     pub fn bad(&self) -> u32 {
@@ -322,9 +459,15 @@ impl Cpu {
     }
 
     /// Decode `instruction`'s opcode and run the function
-    fn decode_and_execute(&mut self,
-                          instruction: Instruction,
-                          debugger: &mut Debugger) {
+    fn decode_and_execute<D>(&mut self,
+                             debugger: &mut D,
+                             instruction: Instruction,
+                             shared: &mut SharedState,
+                             renderer: &mut Renderer)
+        where D: Debugger {
+        // Simulate instruction execution time.
+        shared.tk().tick(1);
+
         match instruction.function() {
             0b000000 => match instruction.subfunction() {
                 0b000000 => self.op_sll(instruction),
@@ -336,7 +479,7 @@ impl Cpu {
                 0b001000 => self.op_jr(instruction),
                 0b001001 => self.op_jalr(instruction),
                 0b001100 => self.op_syscall(instruction),
-                0b001101 => self.op_break(instruction),
+                0b001101 => self.op_break(instruction, debugger),
                 0b010000 => self.op_mfhi(instruction),
                 0b010001 => self.op_mthi(instruction),
                 0b010010 => self.op_mflo(instruction),
@@ -372,29 +515,29 @@ impl Cpu {
             0b001101 => self.op_ori(instruction),
             0b001110 => self.op_xori(instruction),
             0b001111 => self.op_lui(instruction),
-            0b010000 => self.op_cop0(instruction),
+            0b010000 => self.op_cop0(instruction, shared),
             0b010001 => self.op_cop1(instruction),
             0b010010 => self.op_cop2(instruction),
             0b010011 => self.op_cop3(instruction),
-            0b100000 => self.op_lb(instruction, debugger),
-            0b100001 => self.op_lh(instruction, debugger),
-            0b100010 => self.op_lwl(instruction, debugger),
-            0b100011 => self.op_lw(instruction, debugger),
-            0b100100 => self.op_lbu(instruction, debugger),
-            0b100101 => self.op_lhu(instruction, debugger),
-            0b100110 => self.op_lwr(instruction, debugger),
-            0b101000 => self.op_sb(instruction, debugger),
-            0b101001 => self.op_sh(instruction, debugger),
-            0b101010 => self.op_swl(instruction, debugger),
-            0b101011 => self.op_sw(instruction, debugger),
-            0b101110 => self.op_swr(instruction, debugger),
+            0b100000 => self.op_lb(instruction, debugger, shared),
+            0b100001 => self.op_lh(instruction, debugger, shared),
+            0b100010 => self.op_lwl(instruction, debugger, shared),
+            0b100011 => self.op_lw(instruction, debugger, shared),
+            0b100100 => self.op_lbu(instruction, debugger, shared),
+            0b100101 => self.op_lhu(instruction, debugger, shared),
+            0b100110 => self.op_lwr(instruction, debugger, shared),
+            0b101000 => self.op_sb(instruction, debugger, shared, renderer),
+            0b101001 => self.op_sh(instruction, debugger, shared, renderer),
+            0b101010 => self.op_swl(instruction, debugger, shared, renderer),
+            0b101011 => self.op_sw(instruction, debugger, shared, renderer),
+            0b101110 => self.op_swr(instruction, debugger, shared, renderer),
             0b110000 => self.op_lwc0(instruction),
             0b110001 => self.op_lwc1(instruction),
-            0b110010 => self.op_lwc2(instruction),
+            0b110010 => self.op_lwc2(instruction, debugger, shared),
             0b110011 => self.op_lwc3(instruction),
             0b111000 => self.op_swc0(instruction),
             0b111001 => self.op_swc1(instruction),
-            0b111010 => self.op_swc2(instruction),
+            0b111010 => self.op_swc2(instruction, debugger, shared, renderer),
             0b111011 => self.op_swc3(instruction),
             _        => self.op_illegal(instruction),
         }
@@ -402,7 +545,12 @@ impl Cpu {
 
     /// Illegal instruction
     fn op_illegal(&mut self, instruction: Instruction) {
-        println!("Illegal instruction {}!", instruction);
+        self.delayed_load();
+
+        warn!("Illegal instruction {} at PC 0x{:08x}!",
+              instruction,
+              self.current_pc);
+
         self.exception(Exception::IllegalInstruction);
     }
 
@@ -413,6 +561,8 @@ impl Cpu {
         let d = instruction.d();
 
         let v = self.reg(t) << i;
+
+        self.delayed_load();
 
         self.set_reg(d, v);
     }
@@ -425,6 +575,8 @@ impl Cpu {
 
         let v = self.reg(t) >> i;
 
+        self.delayed_load();
+
         self.set_reg(d, v);
     }
 
@@ -435,6 +587,8 @@ impl Cpu {
         let d = instruction.d();
 
         let v = (self.reg(t) as i32) >> i;
+
+        self.delayed_load();
 
         self.set_reg(d, v as u32);
     }
@@ -448,6 +602,8 @@ impl Cpu {
         // Shift amount is truncated to 5 bits
         let v = self.reg(t) << (self.reg(s) & 0x1f);
 
+        self.delayed_load();
+
         self.set_reg(d, v);
     }
 
@@ -459,6 +615,8 @@ impl Cpu {
 
         // Shift amount is truncated to 5 bits
         let v = self.reg(t) >> (self.reg(s) & 0x1f);
+
+        self.delayed_load();
 
         self.set_reg(d, v);
     }
@@ -472,11 +630,13 @@ impl Cpu {
         // Shift amount is truncated to 5 bits
         let v = (self.reg(t) as i32) >> (self.reg(s) & 0x1f);
 
+        self.delayed_load();
+
         self.set_reg(d, v as u32);
     }
 
     /// Various branch instructions: BGEZ, BLTZ, BGEZAL, BLTZAL. Bits
-    /// 16 and 20 are used to figure out which one to use
+    /// [20:16] are used to figure out which one to use
     fn op_bxx(&mut self, instruction: Instruction) {
         let i = instruction.imm_se();
         let s = instruction.s();
@@ -484,7 +644,10 @@ impl Cpu {
         let instruction = instruction.0;
 
         let is_bgez = (instruction >> 16) & 1;
-        let is_link = (instruction >> 20) & 1 != 0;
+        // It's not enough to test for bit 20 to see if we're supposed
+        // to link, if any bit in the range [19:17] is set the link
+        // doesn't take place and RA is left untouched.
+        let is_link = (instruction >> 17) & 0xf == 0x8;
 
         let v = self.reg(s) as i32;
 
@@ -496,14 +659,18 @@ impl Cpu {
         // xor takes care of that.
         let test = test ^ is_bgez;
 
+        self.delayed_load();
+
+        // If linking is requested it occurs unconditionally, even if
+        // the branch is not taken
+        if is_link {
+            let ra = self.next_pc;
+
+            // Store return address in R31
+            self.set_reg(RegisterIndex(31), ra);
+        }
+
         if test != 0 {
-            if is_link {
-                let ra = self.next_pc;
-
-                // Store return address in R31
-                self.set_reg(RegisterIndex(31), ra);
-            }
-
             self.branch(i);
         }
     }
@@ -513,6 +680,8 @@ impl Cpu {
         let s = instruction.s();
 
         self.next_pc = self.reg(s);
+
+        self.delayed_load();
 
         self.branch = true;
     }
@@ -524,25 +693,35 @@ impl Cpu {
 
         let ra = self.next_pc;
 
+        self.next_pc = self.reg(s);
+
+        self.delayed_load();
+
         // Store return address in `d`
         self.set_reg(d, ra);
-
-        self.next_pc = self.reg(s);
 
         self.branch = true;
     }
 
     /// System Call
     fn op_syscall(&mut self, _: Instruction) {
+        self.delayed_load();
+
         self.exception(Exception::SysCall);
     }
 
     /// Break
-    fn op_break(&mut self, _: Instruction) {
-        // Should I do something special with the debugger here? Might
-        // be convenient if somebody wants to debug with the BREAK
-        // instruction in custom code.
-        self.exception(Exception::Break);
+    fn op_break<D: Debugger>(&mut self,
+                             _: Instruction,
+                             debugger: &mut D) {
+        self.delayed_load();
+
+        if self.debug_on_break {
+            info!("BREAK instruction while debug_on_break is active");
+            debugger.trigger_break();
+        } else {
+            self.exception(Exception::Break);
+        }
     }
 
     /// Move From HI
@@ -550,6 +729,8 @@ impl Cpu {
         let d = instruction.d();
 
         let hi = self.hi;
+
+        self.delayed_load();
 
         self.set_reg(d, hi);
     }
@@ -559,6 +740,8 @@ impl Cpu {
         let s = instruction.s();
 
         self.hi = self.reg(s);
+
+        self.delayed_load();
     }
 
     /// Move From LO
@@ -566,6 +749,8 @@ impl Cpu {
         let d = instruction.d();
 
         let lo = self.lo;
+
+        self.delayed_load();
 
         self.set_reg(d, lo);
     }
@@ -575,6 +760,8 @@ impl Cpu {
         let s = instruction.s();
 
         self.lo = self.reg(s);
+
+        self.delayed_load();
     }
 
     /// Multiply (signed)
@@ -584,6 +771,8 @@ impl Cpu {
 
         let a = (self.reg(s) as i32) as i64;
         let b = (self.reg(t) as i32) as i64;
+
+        self.delayed_load();
 
         let v = (a * b) as u64;
 
@@ -599,6 +788,8 @@ impl Cpu {
         let a = self.reg(s) as u64;
         let b = self.reg(t) as u64;
 
+        self.delayed_load();
+
         let v = a * b;
 
         self.hi = (v >> 32) as u32;
@@ -612,6 +803,8 @@ impl Cpu {
 
         let n = self.reg(s) as i32;
         let d = self.reg(t) as i32;
+
+        self.delayed_load();
 
         if d == 0 {
             // Division by zero, results are bogus
@@ -640,6 +833,8 @@ impl Cpu {
         let n = self.reg(s);
         let d = self.reg(t);
 
+        self.delayed_load();
+
         if d == 0 {
             // Division by zero, results are bogus
             self.hi = n;
@@ -659,6 +854,8 @@ impl Cpu {
         let s = self.reg(s) as i32;
         let t = self.reg(t) as i32;
 
+        self.delayed_load();
+
         match s.checked_add(t) {
             Some(v) => self.set_reg(d, v as u32),
             None    => self.exception(Exception::Overflow),
@@ -673,6 +870,8 @@ impl Cpu {
 
         let v = self.reg(s).wrapping_add(self.reg(t));
 
+        self.delayed_load();
+
         self.set_reg(d, v);
     }
 
@@ -684,6 +883,8 @@ impl Cpu {
 
         let s = self.reg(s) as i32;
         let t = self.reg(t) as i32;
+
+        self.delayed_load();
 
         match s.checked_sub(t) {
             Some(v) => self.set_reg(d, v as u32),
@@ -699,6 +900,8 @@ impl Cpu {
 
         let v = self.reg(s).wrapping_sub(self.reg(t));
 
+        self.delayed_load();
+
         self.set_reg(d, v);
     }
 
@@ -709,6 +912,8 @@ impl Cpu {
         let t = instruction.t();
 
         let v = self.reg(s) & self.reg(t);
+
+        self.delayed_load();
 
         self.set_reg(d, v);
     }
@@ -721,6 +926,8 @@ impl Cpu {
 
         let v = self.reg(s) | self.reg(t);
 
+        self.delayed_load();
+
         self.set_reg(d, v);
     }
 
@@ -731,6 +938,8 @@ impl Cpu {
         let t = instruction.t();
 
         let v = self.reg(s) ^ self.reg(t);
+
+        self.delayed_load();
 
         self.set_reg(d, v);
     }
@@ -743,6 +952,8 @@ impl Cpu {
 
         let v = !(self.reg(s) | self.reg(t));
 
+        self.delayed_load();
+
         self.set_reg(d, v);
     }
 
@@ -754,6 +965,8 @@ impl Cpu {
 
         let s = self.reg(s) as i32;
         let t = self.reg(t) as i32;
+
+        self.delayed_load();
 
         let v = s < t;
 
@@ -768,6 +981,8 @@ impl Cpu {
 
         let v = self.reg(s) < self.reg(t);
 
+        self.delayed_load();
+
         self.set_reg(d, v as u32);
     }
 
@@ -778,16 +993,18 @@ impl Cpu {
         self.next_pc = (self.pc & 0xf0000000) | (i << 2);
 
         self.branch = true;
+
+        self.delayed_load();
     }
 
     /// Jump And Link
     fn op_jal(&mut self, instruction: Instruction) {
         let ra = self.next_pc;
 
+        self.op_j(instruction);
+
         // Store return address in R31
         self.set_reg(RegisterIndex(31), ra);
-
-        self.op_j(instruction);
 
         self.branch = true;
     }
@@ -801,6 +1018,8 @@ impl Cpu {
         if self.reg(s) == self.reg(t) {
             self.branch(i);
         }
+
+        self.delayed_load();
     }
 
     /// Branch if Not Equal
@@ -812,6 +1031,8 @@ impl Cpu {
         if self.reg(s) != self.reg(t) {
             self.branch(i);
         }
+
+        self.delayed_load();
     }
 
     /// Branch if Less than or Equal to Zero
@@ -824,6 +1045,8 @@ impl Cpu {
         if v <= 0 {
             self.branch(i);
         }
+
+        self.delayed_load();
     }
 
     /// Branch if Greater Than Zero
@@ -836,6 +1059,8 @@ impl Cpu {
         if v > 0 {
             self.branch(i);
         }
+
+        self.delayed_load();
     }
 
     /// Add Immediate and check for signed overflow
@@ -845,6 +1070,8 @@ impl Cpu {
         let s = instruction.s();
 
         let s = self.reg(s) as i32;
+
+        self.delayed_load();
 
         match s.checked_add(i) {
             Some(v) => self.set_reg(t, v as u32),
@@ -860,6 +1087,8 @@ impl Cpu {
 
         let v = self.reg(s).wrapping_add(i);
 
+        self.delayed_load();
+
         self.set_reg(t, v);
     }
 
@@ -870,6 +1099,8 @@ impl Cpu {
         let t = instruction.t();
 
         let v = (self.reg(s) as i32) < i;
+
+        self.delayed_load();
 
         self.set_reg(t, v as u32);
     }
@@ -882,6 +1113,8 @@ impl Cpu {
 
         let v = self.reg(s) < i;
 
+        self.delayed_load();
+
         self.set_reg(t, v as u32);
     }
 
@@ -892,6 +1125,8 @@ impl Cpu {
         let s = instruction.s();
 
         let v = self.reg(s) & i;
+
+        self.delayed_load();
 
         self.set_reg(t, v);
     }
@@ -904,6 +1139,8 @@ impl Cpu {
 
         let v = self.reg(s) | i;
 
+        self.delayed_load();
+
         self.set_reg(t, v);
     }
 
@@ -914,6 +1151,8 @@ impl Cpu {
         let s = instruction.s();
 
         let v = self.reg(s) ^ i;
+
+        self.delayed_load();
 
         self.set_reg(t, v);
     }
@@ -926,48 +1165,57 @@ impl Cpu {
         // Low 16bits are set to 0
         let v = i << 16;
 
+        self.delayed_load();
+
         self.set_reg(t, v);
     }
 
     /// Coprocessor 0 opcode
-    fn op_cop0(&mut self, instruction: Instruction) {
+    fn op_cop0(&mut self, instruction: Instruction, shared: &mut SharedState) {
         match instruction.cop_opcode() {
-            0b00000 => self.op_mfc0(instruction),
+            0b00000 => self.op_mfc0(instruction, shared),
             0b00100 => self.op_mtc0(instruction),
             0b10000 => self.op_rfe(instruction),
             _       => panic!("unhandled cop0 instruction {}", instruction)
         }
     }
 
-    /// Coprocessor 1 opcode (does not exist on the Playstation)
-    fn op_cop1(&mut self, _: Instruction) {
-        self.exception(Exception::CoprocessorError);
-    }
-
-    /// Coprocessor 2 opcode (GTE)
-    fn op_cop2(&mut self, instruction: Instruction) {
-        panic!("unhandled GTE instruction: {}", instruction);
-    }
-
-    /// Coprocessor 3 opcode (does not exist on the Playstation)
-    fn op_cop3(&mut self, _: Instruction) {
-        self.exception(Exception::CoprocessorError);
-    }
-
     /// Move From Coprocessor 0
-    fn op_mfc0(&mut self, instruction: Instruction) {
+    fn op_mfc0(&mut self, instruction: Instruction, shared: &mut SharedState) {
         let cpu_r = instruction.t();
         let cop_r = instruction.d().0;
 
         let v = match cop_r {
-            12 => self.sr.as_u32(),
-            13 => self.cause,
-            14 => self.epc,
-            _  =>
-                panic!("Unhandled read from cop0r{}", cop_r),
+            6 => {
+                // No$ says this register "randomly" memorizes a jump
+                // target after certain exceptions occur. Doesn't seem
+                // very useful and would require a lot more testing to
+                // implement accurately.
+                warn!("Unhandled read from JUMP_DEST (cop0r6)");
+                0
+            }
+            7 => {
+                // DCIC: breakpoint control
+                warn!("Unhandled read from DCIC (cop0r7)");
+                0
+            }
+            8 => {
+                // This register should be mostly useless on the
+                // PlayStation since it doesn't have virtual memory,
+                // however some exceptions do write to this register
+                // so maybe we'll have to implement this correctly
+                // some day.
+                warn!("Unhandled read from BAD_VADDR (cop0r8)");
+                0
+            }
+            12 => self.cop0.sr(),
+            13 => self.cop0.cause(*shared.irq_state()),
+            14 => self.cop0.epc(),
+            15 => PROCESSOR_ID,
+            _  => panic!("Unhandled read from cop0r{}", cop_r),
         };
 
-        self.load = (cpu_r, v)
+        self.delayed_load_chain(cpu_r, v);
     }
 
     /// Move To Coprocessor 0
@@ -977,37 +1225,123 @@ impl Cpu {
 
         let v = self.reg(cpu_r);
 
+        self.delayed_load();
+
         match cop_r {
             3 | 5 | 6 | 7 | 9 | 11  => // Breakpoints registers
                 if v != 0 {
                     panic!("Unhandled write to cop0r{}: {:08x}", cop_r, v)
                 },
-            12 => self.sr = StatusRegister(v),
-            13 => // Cause register
-                if v != 0 {
-                    panic!("Unhandled write to CAUSE register: {:08x}", v)
-                },
+            12 => self.cop0.set_sr(v),
+            13 => self.cop0.set_cause(v),
             _  => panic!("Unhandled cop0 register {}", cop_r),
         }
     }
 
     /// Return From Exception
     fn op_rfe(&mut self, instruction: Instruction) {
+        self.delayed_load();
+
         // There are other instructions with the same encoding but all
-        // are virtual memory related and the Playstation doesn't
+        // are virtual memory related and the PlayStation doesn't
         // implement them. Still, let's make sure we're not running
         // buggy code.
         if instruction.0 & 0x3f != 0b010000 {
             panic!("Invalid cop0 instruction: {}", instruction);
         }
 
-        self.sr.return_from_exception();
+        self.cop0.return_from_exception();
+    }
+
+    /// Coprocessor 1 opcode (does not exist on the PlayStation)
+    fn op_cop1(&mut self, _: Instruction) {
+        self.delayed_load();
+
+        self.exception(Exception::CoprocessorError);
+    }
+
+    /// Coprocessor 2 opcode (GTE)
+    fn op_cop2(&mut self, instruction: Instruction) {
+        // XXX: we should check that the GTE is enabled in cop0's
+        // status register, otherwise the cop2 instructions seem to
+        // freeze the CPU (or maybe raise an exception?). Furthermore
+        // it seems that one has to wait at least two cycles (tested
+        // with two nops) after raising the flag in the status
+        // register before the GTE can be accessed.
+        let cop_opcode = instruction.cop_opcode();
+
+        if cop_opcode & 0x10 != 0 {
+            // GTE command
+            // XXX handle GTE command duration
+            self.gte.command(instruction.0);
+        } else {
+            match cop_opcode {
+                0b00000 => self.op_mfc2(instruction),
+                0b00010 => self.op_cfc2(instruction),
+                0b00100 => self.op_mtc2(instruction),
+                0b00110 => self.op_ctc2(instruction),
+                _       => panic!("unhandled GTE instruction {}", instruction),
+            }
+        }
+    }
+
+    /// Move From Coprocessor 2 Data register
+    fn op_mfc2(&mut self, instruction: Instruction) {
+        let cpu_r = instruction.t();
+        let cop_r = instruction.d().0;
+
+        let v = self.gte.data(cop_r);
+
+        self.delayed_load_chain(cpu_r, v);
+    }
+
+    /// Move From Coprocessor 2 Control register
+    fn op_cfc2(&mut self, instruction: Instruction) {
+        let cpu_r = instruction.t();
+        let cop_r = instruction.d().0;
+
+        let v = self.gte.control(cop_r);
+
+        self.delayed_load_chain(cpu_r, v);
+    }
+
+    /// Move To Coprocessor 2 Data register
+    fn op_mtc2(&mut self, instruction: Instruction) {
+        let cpu_r = instruction.t();
+        let cop_r = instruction.d().0;
+
+        let v = self.reg(cpu_r);
+
+        self.delayed_load();
+
+        self.gte.set_data(cop_r, v);
+    }
+
+
+    /// Move To Coprocessor 2 Control register
+    fn op_ctc2(&mut self, instruction: Instruction) {
+        let cpu_r = instruction.t();
+        let cop_r = instruction.d().0;
+
+        let v = self.reg(cpu_r);
+
+        self.delayed_load();
+
+        self.gte.set_control(cop_r, v);
+    }
+
+    /// Coprocessor 3 opcode (does not exist on the PlayStation)
+    fn op_cop3(&mut self, _: Instruction) {
+        self.delayed_load();
+
+        self.exception(Exception::CoprocessorError);
     }
 
     /// Load Byte (signed)
-    fn op_lb(&mut self,
-             instruction: Instruction,
-             debugger: &mut Debugger) {
+    fn op_lb<D: Debugger>(&mut self,
+                          instruction: Instruction,
+                          debugger: &mut D,
+                          shared: &mut SharedState) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1016,16 +1350,16 @@ impl Cpu {
         let addr = self.reg(s).wrapping_add(i);
 
         // Cast as i8 to force sign extension
-        let v = self.load::<u8>(addr, debugger) as i8;
+        let v = self.load::<Byte, D>(debugger, shared, addr) as i8;
 
-        // Put the load in the delay slot
-        self.load = (t, v as u32);
+        self.delayed_load_chain(t, v as u32);
     }
 
     /// Load Halfword (signed)
-    fn op_lh(&mut self,
-             instruction: Instruction,
-             debugger: &mut Debugger) {
+    fn op_lh<D: Debugger>(&mut self,
+                          instruction: Instruction,
+                          debugger: &mut D,
+                          shared: &mut SharedState) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1033,17 +1367,23 @@ impl Cpu {
 
         let addr = self.reg(s).wrapping_add(i);
 
-        // Cast as i16 to force sign extension
-        let v = self.load::<u16>(addr, debugger) as i16;
+        // Address must be 16bit aligned
+        if addr % 2 == 0 {
+            // Cast as i16 to force sign extension
+            let v = self.load::<HalfWord, D>(debugger, shared, addr) as i16;
 
-        // Put the load in the delay slot
-        self.load = (t, v as u32);
+            self.delayed_load_chain(t, v as u32);
+        } else {
+            self.delayed_load();
+            self.exception(Exception::LoadAddressError);
+        }
     }
 
     /// Load Word Left (little-endian only implementation)
-    fn op_lwl(&mut self,
-              instruction: Instruction,
-              debugger: &mut Debugger) {
+    fn op_lwl<D: Debugger>(&mut self,
+                           instruction: Instruction,
+                           debugger: &mut D,
+                           shared: &mut SharedState) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1054,12 +1394,19 @@ impl Cpu {
         // This instruction bypasses the load delay restriction: this
         // instruction will merge the new contents with the value
         // currently being loaded if need be.
-        let cur_v = self.out_regs[t.0 as usize];
+        let (pending_reg, pending_value) = self.load;
+
+        let cur_v =
+            if pending_reg == t {
+                pending_value
+            } else {
+                self.reg(t)
+            };
 
         // Next we load the *aligned* word containing the first
         // addressed byte
         let aligned_addr = addr & !3;
-        let aligned_word = self.load::<u32>(aligned_addr, debugger);
+        let aligned_word = self.load::<Word, D>(debugger, shared, aligned_addr);
 
         // Depending on the address alignment we fetch the 1, 2, 3 or
         // 4 *most* significant bytes and put them in the target
@@ -1072,14 +1419,14 @@ impl Cpu {
             _ => unreachable!(),
         };
 
-        // Put the load in the delay slot
-        self.load = (t, v);
+        self.delayed_load_chain(t, v);
     }
 
     /// Load Word
-    fn op_lw(&mut self,
-             instruction: Instruction,
-             debugger: &mut Debugger) {
+    fn op_lw<D: Debugger>(&mut self,
+                          instruction: Instruction,
+                          debugger: &mut D,
+                          shared: &mut SharedState) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1089,19 +1436,20 @@ impl Cpu {
 
         // Address must be 32bit aligned
         if addr % 4 == 0 {
-            let v = self.load(addr, debugger);
+            let v = self.load::<Word, D>(debugger, shared, addr);
 
-            // Put the load in the delay slot
-            self.load = (t, v);
+            self.delayed_load_chain(t, v);
         } else {
+            self.delayed_load();
             self.exception(Exception::LoadAddressError);
         }
     }
 
     /// Load Byte Unsigned
-    fn op_lbu(&mut self,
-              instruction: Instruction,
-              debugger: &mut Debugger) {
+    fn op_lbu<D: Debugger>(&mut self,
+                           instruction: Instruction,
+                           debugger: &mut D,
+                           shared: &mut SharedState) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1109,16 +1457,16 @@ impl Cpu {
 
         let addr = self.reg(s).wrapping_add(i);
 
-        let v = self.load::<u8>(addr, debugger);
+        let v = self.load::<Byte, D>(debugger, shared, addr);
 
-        // Put the load in the delay slot
-        self.load = (t, v as u32);
+        self.delayed_load_chain(t, v as u32);
     }
 
     /// Load Halfword Unsigned
-    fn op_lhu(&mut self,
-              instruction: Instruction,
-              debugger: &mut Debugger) {
+    fn op_lhu<D: Debugger>(&mut self,
+                           instruction: Instruction,
+                           debugger: &mut D,
+                           shared: &mut SharedState) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1128,19 +1476,20 @@ impl Cpu {
 
         // Address must be 16bit aligned
         if addr % 2 == 0 {
-            let v = self.load::<u16>(addr, debugger);
+            let v = self.load::<HalfWord, D>(debugger, shared, addr);
 
-            // Put the load in the delay slot
-            self.load = (t, v as u32);
+            self.delayed_load_chain(t, v);
         } else {
+            self.delayed_load();
             self.exception(Exception::LoadAddressError);
         }
     }
 
     /// Load Word Right (little-endian only implementation)
-    fn op_lwr(&mut self,
-              instruction: Instruction,
-              debugger: &mut Debugger) {
+    fn op_lwr<D: Debugger>(&mut self,
+                           instruction: Instruction,
+                           debugger: &mut D,
+                           shared: &mut SharedState) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1151,12 +1500,19 @@ impl Cpu {
         // This instruction bypasses the load delay restriction: this
         // instruction will merge the new contents with the value
         // currently being loaded if need be.
-        let cur_v = self.out_regs[t.0 as usize];
+        let (pending_reg, pending_value) = self.load;
+
+        let cur_v =
+            if pending_reg == t {
+                pending_value
+            } else {
+                self.reg(t)
+            };
 
         // Next we load the *aligned* word containing the first
         // addressed byte
         let aligned_addr = addr & !3;
-        let aligned_word = self.load::<u32>(aligned_addr, debugger);
+        let aligned_word = self.load::<Word, D>(debugger, shared, aligned_addr);
 
         // Depending on the address alignment we fetch the 1, 2, 3 or
         // 4 *least* significant bytes and put them in the target
@@ -1170,13 +1526,15 @@ impl Cpu {
         };
 
         // Put the load in the delay slot
-        self.load = (t, v);
+        self.delayed_load_chain(t, v);
     }
 
     /// Store Byte
-    fn op_sb(&mut self,
-             instruction: Instruction,
-             debugger: &mut Debugger) {
+    fn op_sb<D: Debugger>(&mut self,
+                          instruction: Instruction,
+                          debugger: &mut D,
+                          shared: &mut SharedState,
+                          renderer: &mut Renderer) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1185,13 +1543,17 @@ impl Cpu {
         let addr = self.reg(s).wrapping_add(i);
         let v    = self.reg(t);
 
-        self.store(addr, v as u8, debugger);
+        self.delayed_load();
+
+        self.store::<Byte, D>(debugger, shared, renderer, addr, v);
     }
 
     /// Store Halfword
-    fn op_sh(&mut self,
-             instruction: Instruction,
-             debugger: &mut Debugger) {
+    fn op_sh<D: Debugger>(&mut self,
+                          instruction: Instruction,
+                          debugger: &mut D,
+                          shared: &mut SharedState,
+                          renderer: &mut Renderer) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1200,18 +1562,22 @@ impl Cpu {
         let addr = self.reg(s).wrapping_add(i);
         let v    = self.reg(t);
 
+        self.delayed_load();
+
         // Address must be 16bit aligned
         if addr % 2 == 0 {
-            self.store(addr, v as u16, debugger);
+            self.store::<HalfWord, D>(debugger, shared, renderer, addr, v);
         } else {
             self.exception(Exception::StoreAddressError);
         }
     }
 
     /// Store Word Left (little-endian only implementation)
-    fn op_swl(&mut self,
-              instruction: Instruction,
-              debugger: &mut Debugger) {
+    fn op_swl<D: Debugger>(&mut self,
+                           instruction: Instruction,
+                           debugger: &mut D,
+                           shared: &mut SharedState,
+                           renderer: &mut Renderer) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1223,23 +1589,28 @@ impl Cpu {
         let aligned_addr = addr & !3;
         // Load the current value for the aligned word at the target
         // address
-        let cur_mem = self.load::<u32>(aligned_addr, debugger);
+        let cur_mem = self.load::<Word, D>(debugger, shared, aligned_addr);
 
-        let mem = match addr & 3 {
-            0 => (cur_mem & 0xffffff00) | (v >> 24),
-            1 => (cur_mem & 0xffff0000) | (v >> 16),
-            2 => (cur_mem & 0xff000000) | (v >> 8),
-            3 => (cur_mem & 0x00000000) | (v >> 0),
-            _ => unreachable!(),
-        };
+        let mem =
+            match addr & 3 {
+                0 => (cur_mem & 0xffffff00) | (v >> 24),
+                1 => (cur_mem & 0xffff0000) | (v >> 16),
+                2 => (cur_mem & 0xff000000) | (v >> 8),
+                3 => (cur_mem & 0x00000000) | (v >> 0),
+                _ => unreachable!(),
+            };
 
-        self.store(addr, mem, debugger);
+        self.delayed_load();
+
+        self.store::<Word, D>(debugger, shared, renderer, aligned_addr, mem);
     }
 
     /// Store Word
-    fn op_sw(&mut self,
-             instruction: Instruction,
-             debugger: &mut Debugger) {
+    fn op_sw<D: Debugger>(&mut self,
+                          instruction: Instruction,
+                          debugger: &mut D,
+                          shared: &mut SharedState,
+                          renderer: &mut Renderer) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1248,18 +1619,22 @@ impl Cpu {
         let addr = self.reg(s).wrapping_add(i);
         let v    = self.reg(t);
 
+        self.delayed_load();
+
         // Address must be 32bit aligned
         if addr % 4 == 0 {
-            self.store(addr, v, debugger);
+            self.store::<Word, D>(debugger, shared, renderer, addr, v);
         } else {
             self.exception(Exception::StoreAddressError);
         }
     }
 
     /// Store Word Right (little-endian only implementation)
-    fn op_swr(&mut self,
-              instruction: Instruction,
-              debugger: &mut Debugger) {
+    fn op_swr<D: Debugger>(&mut self,
+                           instruction: Instruction,
+                           debugger: &mut D,
+                           shared: &mut SharedState,
+                           renderer: &mut Renderer) {
 
         let i = instruction.imm_se();
         let t = instruction.t();
@@ -1271,68 +1646,122 @@ impl Cpu {
         let aligned_addr = addr & !3;
         // Load the current value for the aligned word at the target
         // address
-        let cur_mem = self.load::<u32>(aligned_addr, debugger);
+        let cur_mem = self.load::<Word, D>(debugger, shared, aligned_addr);
 
-        let mem = match addr & 3 {
-            0 => (cur_mem & 0x00000000) | (v << 0),
-            1 => (cur_mem & 0x000000ff) | (v << 8),
-            2 => (cur_mem & 0x0000ffff) | (v << 16),
-            3 => (cur_mem & 0x00ffffff) | (v << 24),
-            _ => unreachable!(),
+        let mem =
+            match addr & 3 {
+                0 => (cur_mem & 0x00000000) | (v << 0),
+                1 => (cur_mem & 0x000000ff) | (v << 8),
+                2 => (cur_mem & 0x0000ffff) | (v << 16),
+                3 => (cur_mem & 0x00ffffff) | (v << 24),
+                _ => unreachable!(),
         };
 
-        self.store(addr, mem, debugger);
+        self.delayed_load();
+
+        self.store::<Word, D>(debugger, shared, renderer, aligned_addr, mem);
     }
 
     /// Load Word in Coprocessor 0
     fn op_lwc0(&mut self, _: Instruction) {
+        self.delayed_load();
+
         // Not supported by this coprocessor
         self.exception(Exception::CoprocessorError);
     }
 
     /// Load Word in Coprocessor 1
     fn op_lwc1(&mut self, _: Instruction) {
+        self.delayed_load();
+
         // Not supported by this coprocessor
         self.exception(Exception::CoprocessorError);
     }
 
     /// Load Word in Coprocessor 2
-    fn op_lwc2(&mut self, instruction: Instruction) {
-        panic!("unhandled GTE LWC: {}", instruction);
+    fn op_lwc2<D: Debugger>(&mut self,
+                            instruction: Instruction,
+                            debugger: &mut D,
+                            shared: &mut SharedState) {
+
+        let i = instruction.imm_se();
+        let cop_r = instruction.t().0;
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+
+        self.delayed_load();
+
+        // Address must be 32bit aligned
+        if addr % 4 == 0 {
+            let v = self.load::<Word, D>(debugger, shared, addr);
+
+            // Send to coprocessor
+            self.gte.set_data(cop_r, v);
+        } else {
+            self.exception(Exception::LoadAddressError);
+        }
     }
 
     /// Load Word in Coprocessor 3
     fn op_lwc3(&mut self, _: Instruction) {
+        self.delayed_load();
+
         // Not supported by this coprocessor
         self.exception(Exception::CoprocessorError);
     }
 
     /// Store Word in Coprocessor 0
     fn op_swc0(&mut self, _: Instruction) {
+        self.delayed_load();
+
         // Not supported by this coprocessor
         self.exception(Exception::CoprocessorError);
     }
 
     /// Store Word in Coprocessor 1
     fn op_swc1(&mut self, _: Instruction) {
+        self.delayed_load();
+
         // Not supported by this coprocessor
         self.exception(Exception::CoprocessorError);
     }
 
     /// Store Word in Coprocessor 2
-    fn op_swc2(&mut self, instruction: Instruction) {
-        panic!("unhandled GTE SWC: {}", instruction);
+    fn op_swc2<D: Debugger>(&mut self,
+                            instruction: Instruction,
+                            debugger: &mut D,
+                            shared: &mut SharedState,
+                            renderer: &mut Renderer) {
+        let i = instruction.imm_se();
+        let cop_r = instruction.t().0;
+        let s = instruction.s();
+
+        let addr = self.reg(s).wrapping_add(i);
+        let v = self.gte.data(cop_r);
+
+        self.delayed_load();
+
+        // Address must be 32bit aligned
+        if addr % 4 == 0 {
+            self.store::<Word, D>(debugger, shared, renderer, addr, v);
+        } else {
+            self.exception(Exception::LoadAddressError);
+        }
     }
 
     /// Store Word in Coprocessor 3
     fn op_swc3(&mut self, _: Instruction) {
+        self.delayed_load();
+
         // Not supported by this coprocessor
         self.exception(Exception::CoprocessorError);
     }
 }
 
-#[derive(Clone,Copy)]
-pub struct Instruction(u32);
+/// Simple wrapper around an instruction word to provide type-safety.
+#[derive(Clone, Copy, RustcDecodable, RustcEncodable)]
+struct Instruction(u32);
 
 impl Instruction {
     /// Return bits [31:26] of the instruction
@@ -1407,92 +1836,27 @@ impl Instruction {
 
         op & 0x3ffffff
     }
+
+    /// Return true if the instruction contains a GTE/COP2 opcode
+    fn is_gte_op(self) -> bool {
+        // XXX This will match all GTE instructions including mfc/mtc
+        // and friends, do we only want to match GTE operations
+        // instead?
+        self.function() == 0b010001
+    }
 }
 
 impl Display for Instruction {
     fn fmt(&self, f: &mut Formatter) -> Result<(), Error> {
-        try!(write!(f, "{:08x}", self.0));
-
-        Ok(())
+        write!(f, "{:08x}", self.0)
     }
 }
 
-/// Exception types (as stored in the `CAUSE` register)
-#[derive(Clone,Copy)]
-enum Exception {
-    /// Address error on load
-    LoadAddressError = 0x4,
-    /// Address error on store
-    StoreAddressError = 0x5,
-    /// System call (caused by the SYSCALL opcode)
-    SysCall = 0x8,
-    /// Breakpoint (caused by the BREAK opcode)
-    Break = 0x9,
-    /// CPU encountered an unknown instruction
-    IllegalInstruction = 0xa,
-    /// Unsupported coprocessor operation
-    CoprocessorError = 0xb,
-    /// Arithmetic overflow
-    Overflow = 0xc,
-}
-
-#[derive(Clone,Copy)]
+#[derive(Clone, Copy, RustcDecodable, RustcEncodable, PartialEq, Eq)]
 struct RegisterIndex(u32);
 
-#[derive(Clone,Copy)]
-struct StatusRegister(u32);
-
-impl StatusRegister {
-
-    fn as_u32(self) -> u32 {
-        self.0
-    }
-
-    fn cache_isolated(self) -> bool {
-        self.0 & 0x10000 != 0
-    }
-
-    /// Return the exception handler address depending on the value of
-    /// the BEV bit
-    fn exception_handler(self) -> u32 {
-        match self.0 & (1 << 22) != 0 {
-            true  => 0xbfc00180,
-            false => 0x80000080,
-        }
-    }
-
-    /// Shift bits [5:0] of `SR` two places to the left. Those bits
-    /// are three pairs of Interrupt Enable/User Mode bits behaving
-    /// like a stack 3 entries deep. Entering an exception pushes a
-    /// pair of zeroes by left shifting the stack which disables
-    /// interrupts and puts the CPU in kernel mode. The original third
-    /// entry is discarded (it's up to the kernel to handle more than
-    /// two recursive exception levels).
-    fn enter_exception(&mut self) {
-        let mut sr = self.0;
-
-        let mode = sr & 0x3f;
-        sr &= !0x3f;
-        sr |= (mode << 2) & 0x3f;
-
-        *self = StatusRegister(sr);
-    }
-
-    /// The opposite of `enter_exception`: shift mode the other way
-    /// around, discarding the current state.
-    fn return_from_exception(&mut self) {
-        let mut sr = self.0;
-
-        let mode = sr & 0x3f;
-        sr &= !0x3f;
-        sr |= mode >> 2;
-
-        *self = StatusRegister(sr);
-    }
-}
-
 /// Instruction cache line
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, RustcDecodable, RustcEncodable)]
 struct ICacheLine {
     /// Tag: high 22bits of the address associated with this cacheline
     /// Valid bits: 3 bit index of the first valid word in line.
@@ -1509,7 +1873,8 @@ impl ICacheLine {
             // Tag is 0, all line valid
             tag_valid: 0x0,
             // BREAK opcode
-            line: [Instruction(0x00bad0d); 4],
+            //line: [Instruction(0xbadc0de5); 4],
+            line: [Instruction(0); 4],
         }
     }
 
@@ -1529,7 +1894,7 @@ impl ICacheLine {
     /// Set the cacheline's tag and valid bits. `pc` is the first
     /// valid PC in the cacheline.
     fn set_tag_valid(&mut self, pc: u32) {
-        self.tag_valid =  pc & 0xfffff00c;
+        self.tag_valid =  pc & 0x7ffff00c;
     }
 
     /// Invalidate the entire cacheline by pushing the index out of
@@ -1549,3 +1914,19 @@ impl ICacheLine {
         self.line[index as usize] = instruction;
     }
 }
+
+impl Default for ICacheLine {
+    fn default() -> ICacheLine {
+        ICacheLine::new()
+    }
+}
+
+/// Serializable container for the cachelines
+buffer!(struct ICacheLines([ICacheLine; 0x100]));
+
+/// Value of the "Processor ID" register (Cop0r15). This is the value
+/// returned by my SCPH-7502.
+pub const PROCESSOR_ID: u32 = 0x00000002;
+
+/// PlayStation CPU clock in Hz
+pub const CPU_FREQ_HZ: u32 = 33_868_500;
